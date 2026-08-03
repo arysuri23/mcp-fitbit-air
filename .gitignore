@@ -15,3 +15,5 @@ token.json
 client_secret*.json
 spike/raw/
 .env
+spike/raw2/
+spike/token.json
