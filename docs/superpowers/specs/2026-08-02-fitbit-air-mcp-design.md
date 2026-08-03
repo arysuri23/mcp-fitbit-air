@@ -159,9 +159,15 @@ The workhorse; should answer most questions in a single call. Returns one row pe
 - SpO2
 - Skin temperature deviation
 
-Fans out to several `dailyRollup` calls **concurrently** and stitches results into a
-per-day table. Capped at **90 days** per call; beyond that, returns an `error` naming
-the cap and suggesting a narrower range.
+Fans out **concurrently** and stitches results into a per-day table. The fan-out is
+*mixed*, because data types support different methods: `steps` and `active-zone-minutes`
+use `dailyRollUp`, while `sleep` and the pre-aggregated `daily-*` types
+(`daily-resting-heart-rate`, `daily-heart-rate-variability`, `daily-oxygen-saturation`,
+`daily-sleep-temperature-derivations`) support only `list`, filtered by an AIP-160
+`filter` expression. Per-metric method selection lives in the mapping table.
+
+Capped at **90 days** per call, matching the API's own limit for these types; beyond
+that, returns an `error` naming the cap and suggesting a narrower range.
 
 ### `get_metric_series(metric, start_date, end_date, granularity)`
 
@@ -175,8 +181,9 @@ description enumerates the names, and an unrecognized value returns an `error` l
 the valid options rather than failing opaquely.
 
 Intraday is force-capped to **7 days** regardless of the range requested, because
-minute-level data over longer spans would overwhelm the context window. When truncation
-occurs the response states plainly that it happened and why.
+minute-level data over longer spans would overwhelm the context window. (The API's own
+limit for `heart-rate` is 14 days, so this cap is the stricter of the two.) When
+truncation occurs the response states plainly that it happened and why.
 
 ### `get_sleep_detail(date)`
 
