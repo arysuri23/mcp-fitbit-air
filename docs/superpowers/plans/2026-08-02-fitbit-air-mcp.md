@@ -1196,6 +1196,7 @@ Three things about this API make a naive mapping wrong:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -1207,17 +1208,32 @@ class UnknownMetricError(Exception):
 
 
 def coerce_number(value: Any) -> float | None:
-    """Coerce an API value to a float. Integers arrive as JSON strings."""
+    """Coerce an API value to a finite float, or None.
+
+    Two things make this load-bearing rather than defensive padding:
+
+    - Integers arrive as JSON strings throughout this API ("8630", "61").
+    - The API returns the literal string "NaN" for fields it cannot compute
+      yet, e.g. baselineTemperatureCelsius before enough nights of history.
+      Python's float("NaN") accepts that happily, and a NaN would poison every
+      average it reached and serialise as bare `NaN` — which is invalid JSON,
+      on a stdout stream that carries the MCP protocol.
+
+    Returning None for non-finite values is the correct semantic: the layers
+    above already render a missing value as no_data rather than inventing one.
+    """
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
+        number = float(value)
+    elif isinstance(value, str):
         try:
-            return float(value)
+            number = float(value)
         except ValueError:
             return None
-    return None
+    else:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def dig(point: dict, *path: str) -> Any:
