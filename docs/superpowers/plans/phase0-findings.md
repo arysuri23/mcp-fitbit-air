@@ -5,22 +5,43 @@ Fitbit Air paired since:
 
 ## Q1: Publishing status and refresh token lifetime
 
-**ANSWERED — 2026-08-02.**
+**ANSWERED — 2026-08-02. Revised the same day; see the correction below.**
 
-What happened when setting publishing status to "In production": published
-straight through. No verification demand, no CASA security assessment prompt,
-despite Google Health scopes being classified Restricted.
+First attempt: publishing to "In production" went straight through with no
+verification demand. **That reading was wrong** — the app was not yet requesting
+any restricted scope, so there was nothing to gate on.
 
-Does the personal-use exception apply: yes, in effect — the app reached
-"In production" without a verification gate.
+Correction: once the `googlehealth.*` scopes were added, the app had to be
+reverted to **Testing** publishing status. This is the documented behaviour:
 
-Refresh token lifetime: long-lived. The app is out of Testing status, so the
-7-day test-user authorization expiry does not apply.
+- All Google Health scopes are classified **Restricted**.
+- Restricted scopes cannot reach production without brand verification plus an
+  annual CASA security assessment.
+- The personal-use exception ("you are the only user of your app") exempts you
+  from *verification*, not from the production gate. It keeps the app in an
+  unverified state, subject to a user cap — which in practice means Testing.
 
-**Decision:** proceed as designed. The riskiest assumption in the spec holds;
-no redesign needed. `auth.py`'s handling of revoked-token refresh failures
-(Task 3) stays as designed — it is still the right behaviour if the grant is
-ever revoked manually, it is simply no longer expected weekly.
+**Refresh token lifetime: 7 days.** In Testing publishing status, test-user
+authorizations expire 7 days from consent. The exemption for basic scopes
+(name / email / profile only) does not apply here. Re-running
+`mcp-fitbit-air auth` is expected roughly weekly.
+
+**Decision: proceed as designed — no code changes needed.** The spec anticipated
+this as the fallback case, and Task 3's `auth.py` already distinguishes an
+expired/revoked refresh from "never authenticated" and names the Testing-status
+7-day expiry in its remedy message. What was written as an edge case is simply
+the normal weekly path now; the behaviour is identical.
+
+**Open follow-up (does not block implementation):** retry "Publish app" now that
+the scopes are attached. The 7-day rule keys off publishing status, not
+verification status — so if Google permits production with an unverified-app
+warning screen rather than hard-blocking, refresh tokens become long-lived.
+If it hard-blocks, weekly re-auth stands.
+
+Rejected alternatives: CASA assessment (cost and effort are aimed at real
+products, not a personal tool); Workspace "Internal" user type (removes both the
+verification requirement and the 7-day expiry, but requires a paid Google
+Workspace domain — unavailable on a personal gmail.com account).
 
 ## Q2: API reachability
 
