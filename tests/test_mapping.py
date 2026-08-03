@@ -1,3 +1,4 @@
+import math
 from datetime import date
 
 import pytest
@@ -84,6 +85,26 @@ def test_coerce_number_handles_json_strings():
     assert coerce_number("not a number") is None
 
 
+def test_coerce_number_rejects_the_string_nan():
+    """The API returns the literal JSON string "NaN" for
+    baselineTemperatureCelsius before Fitbit has established a baseline —
+    this is a real captured value (spike/raw/
+    list_daily-sleep-temperature-derivations_nofilter.json), not a
+    hypothetical. float("NaN") parses successfully in Python but is not
+    valid JSON, so it must be rejected here rather than allowed to poison
+    downstream averages or reach json.dumps."""
+    assert coerce_number("NaN") is None
+
+
+def test_coerce_number_rejects_infinity_strings():
+    assert coerce_number("Infinity") is None
+    assert coerce_number("-Infinity") is None
+
+
+def test_coerce_number_rejects_a_raw_nan_float():
+    assert coerce_number(float("nan")) is None
+
+
 def test_sleep_duration_reads_minutes_asleep_as_a_number():
     point = {"sleep": {"summary": {"minutesAsleep": "385", "minutesAwake": "5"}}}
     assert get_metric("sleep_duration").extract(point) == 385.0
@@ -126,6 +147,22 @@ def test_skin_temperature_deviation_is_nightly_minus_baseline():
 
 def test_skin_temperature_deviation_needs_both_halves():
     point = {"dailySleepTemperatureDerivations": {"nightlyTemperatureCelsius": 34.5}}
+    assert get_metric("skin_temperature_deviation").extract(point) is None
+
+
+def test_skin_temperature_deviation_is_none_when_baseline_is_the_string_nan():
+    """Real captured shape (spike/raw/
+    list_daily-sleep-temperature-derivations_nofilter.json, 2026-07-30):
+    before a baseline is established, baselineTemperatureCelsius arrives as
+    the JSON string "NaN" rather than being omitted. Must resolve to None,
+    not a NaN float."""
+    point = {
+        "dailySleepTemperatureDerivations": {
+            "date": {"year": 2026, "month": 7, "day": 30},
+            "nightlyTemperatureCelsius": 33.25283400809718,
+            "baselineTemperatureCelsius": "NaN",
+        }
+    }
     assert get_metric("skin_temperature_deviation").extract(point) is None
 
 
@@ -216,3 +253,41 @@ def test_sleep_date_uses_local_time_not_utc():
 def test_date_of_returns_none_for_unreadable_points():
     for name in SUMMARY_METRICS:
         assert get_metric(name).date_of({}) is None, name
+
+
+def test_extract_never_returns_a_non_finite_float():
+    """Regression guard: no metric's `extract` may return NaN or Infinity,
+    which json.dumps would serialise as bare (invalid) JSON tokens onto the
+    MCP stdio stream. Exercises every registered metric, including the two
+    derived ones, against points shaped like real captured API payloads —
+    both healthy values and the "NaN"-baseline case that triggered this
+    guard."""
+    points_by_name = {
+        "sleep_duration": {"sleep": {"summary": {"minutesAsleep": "385"}}},
+        "resting_heart_rate": {"dailyRestingHeartRate": {"beatsPerMinute": "58"}},
+        "hrv": {
+            "dailyHeartRateVariability": {
+                "averageHeartRateVariabilityMilliseconds": 42.5
+            }
+        },
+        "spo2": {"dailyOxygenSaturation": {"averagePercentage": 95.8}},
+        "skin_temperature_deviation": {
+            "dailySleepTemperatureDerivations": {
+                "nightlyTemperatureCelsius": 33.25283400809718,
+                "baselineTemperatureCelsius": "NaN",
+            }
+        },
+        "steps": {"steps": {"countSum": "8630"}},
+        "active_zone_minutes": {
+            "activeZoneMinutes": {
+                "sumInFatBurnHeartZone": "10",
+                "sumInCardioHeartZone": "5",
+                "sumInPeakHeartZone": "2",
+            }
+        },
+        "heart_rate": {"heartRate": {"beatsPerMinute": "61"}},
+    }
+    assert set(points_by_name) == set(METRICS)
+    for name, point in points_by_name.items():
+        value = get_metric(name).extract(point)
+        assert value is None or math.isfinite(value), name

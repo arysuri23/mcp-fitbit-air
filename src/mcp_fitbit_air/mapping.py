@@ -19,6 +19,7 @@ Three things about this API make a naive mapping wrong:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -30,16 +31,27 @@ class UnknownMetricError(Exception):
 
 
 def coerce_number(value: Any) -> float | None:
-    """Coerce an API value to a float. Integers arrive as JSON strings."""
+    """Coerce an API value to a float. Integers arrive as JSON strings.
+
+    Before Fitbit has established a baseline (e.g. skin temperature in the
+    first few nights of wear), the API returns the literal JSON string
+    "NaN" rather than omitting the field. `float("NaN")` and
+    `float("Infinity")` both parse successfully in Python but are not valid
+    JSON numbers — a bare NaN/Infinity would corrupt the MCP stdio JSON
+    stream if it ever reached `json.dumps`. Treat all non-finite results as
+    "no value" rather than let them propagate.
+    """
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, (int, float)):
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else None
     if isinstance(value, str):
         try:
-            return float(value)
+            number = float(value)
         except ValueError:
             return None
+        return number if math.isfinite(number) else None
     return None
 
 
