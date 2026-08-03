@@ -11,8 +11,12 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
+from dotenv import load_dotenv
 from google.auth.transport.requests import AuthorizedSession
 from google_auth_oauthlib.flow import InstalledAppFlow
+
+# Load .env from the repo root. Real environment variables win over the file.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 BASE = "https://health.googleapis.com/v4"
 RAW = Path(__file__).parent / "raw"
@@ -26,8 +30,13 @@ SCOPES = [
 
 
 def authenticate() -> AuthorizedSession:
-    client_id = os.environ["FITBIT_MCP_CLIENT_ID"]
-    client_secret = os.environ["FITBIT_MCP_CLIENT_SECRET"]
+    client_id = os.environ.get("FITBIT_MCP_CLIENT_ID")
+    client_secret = os.environ.get("FITBIT_MCP_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        sys.exit(
+            "FITBIT_MCP_CLIENT_ID and FITBIT_MCP_CLIENT_SECRET must be set.\n"
+            "Copy .env.example to .env and fill in your OAuth client values."
+        )
     client_config = {
         "installed": {
             "client_id": client_id,

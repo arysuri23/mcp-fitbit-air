@@ -351,6 +351,7 @@ dependencies = [
     "google-auth>=2.28.0",
     "google-auth-oauthlib>=1.2.0",
     "requests>=2.31.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -403,14 +404,43 @@ def test_token_path_defaults_to_config_dir(monkeypatch):
     assert "mcp-fitbit-air" in str(cfg.token_path)
 
 
-def test_missing_client_id_raises_actionable_error(monkeypatch):
+def test_missing_client_id_raises_actionable_error(monkeypatch, tmp_path):
     monkeypatch.delenv("FITBIT_MCP_CLIENT_ID", raising=False)
     monkeypatch.setenv("FITBIT_MCP_CLIENT_SECRET", "shh")
+    monkeypatch.chdir(tmp_path)  # no .env to fall back on
 
     with pytest.raises(ConfigError) as exc:
         Config.from_env()
 
     assert "FITBIT_MCP_CLIENT_ID" in str(exc.value)
+    assert ".env" in str(exc.value)
+
+
+def test_values_are_read_from_a_dotenv_file(monkeypatch, tmp_path):
+    monkeypatch.delenv("FITBIT_MCP_CLIENT_ID", raising=False)
+    monkeypatch.delenv("FITBIT_MCP_CLIENT_SECRET", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "FITBIT_MCP_CLIENT_ID=from-dotenv\nFITBIT_MCP_CLIENT_SECRET=secret-from-dotenv\n"
+    )
+
+    cfg = Config.from_env()
+
+    assert cfg.client_id == "from-dotenv"
+    assert cfg.client_secret == "secret-from-dotenv"
+
+
+def test_real_environment_wins_over_dotenv(monkeypatch, tmp_path):
+    """Standard precedence: an explicitly exported variable beats the file, so
+    Claude Desktop's `env` block overrides a stale .env left in the repo."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("FITBIT_MCP_CLIENT_ID=from-dotenv\n")
+    monkeypatch.setenv("FITBIT_MCP_CLIENT_ID", "from-environment")
+    monkeypatch.setenv("FITBIT_MCP_CLIENT_SECRET", "shh")
+
+    cfg = Config.from_env()
+
+    assert cfg.client_id == "from-environment"
 
 
 def test_client_config_shape_matches_installed_app_flow(monkeypatch):
@@ -450,6 +480,10 @@ Create `src/mcp_fitbit_air/config.py`:
 
 Nothing here is hardcoded: this is what lets the project be open-sourced
 without a refactor.
+
+Values may also come from a .env file, which is the convenient path for local
+CLI use. Real environment variables take precedence, so the `env` block in an
+MCP client's config always wins over a stale .env left in the checkout.
 """
 
 from __future__ import annotations
@@ -457,6 +491,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
+from dotenv import find_dotenv, load_dotenv
 
 DEFAULT_TOKEN_PATH = Path.home() / ".config" / "mcp-fitbit-air" / "token.json"
 
@@ -479,6 +515,12 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        # usecwd=True searches upward from the working directory. Bare
+        # find_dotenv() would walk up from this module's own location, which
+        # for an installed package is site-packages — nowhere near the user's
+        # project. override=False keeps real environment variables authoritative.
+        load_dotenv(find_dotenv(usecwd=True), override=False)
+
         client_id = os.environ.get("FITBIT_MCP_CLIENT_ID")
         client_secret = os.environ.get("FITBIT_MCP_CLIENT_SECRET")
 
@@ -492,8 +534,9 @@ class Config:
         ]
         if missing:
             raise ConfigError(
-                f"Missing required environment variable(s): {', '.join(missing)}. "
-                "See the README for Google Cloud setup instructions."
+                f"Missing required configuration: {', '.join(missing)}. "
+                "Set these as environment variables, or copy .env.example to .env "
+                "and fill them in. See the README for Google Cloud setup."
             )
 
         token_path_raw = os.environ.get("FITBIT_MCP_TOKEN_PATH")
@@ -3851,10 +3894,13 @@ pip install -e .
 ### 3. Authenticate
 
 ```bash
-export FITBIT_MCP_CLIENT_ID='your-client-id'
-export FITBIT_MCP_CLIENT_SECRET='your-client-secret'
+cp .env.example .env
+# edit .env and fill in your client ID and secret
 mcp-fitbit-air auth
 ```
+
+`.env` is gitignored. Exported environment variables take precedence over it,
+so the `env` block in your MCP client config always wins.
 
 A browser opens for consent. The refresh token is written to
 `~/.config/mcp-fitbit-air/token.json` with `0600` permissions. The server
@@ -3883,6 +3929,9 @@ Add to your MCP client configuration (for Claude Desktop, this is
 Restart the client, then ask: *"Is my Fitbit synced?"*
 
 ## Configuration
+
+Set these as environment variables or in a `.env` file at the project root.
+Environment variables win where both are present.
 
 | Variable | Required | Default |
 |---|---|---|
