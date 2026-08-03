@@ -3131,13 +3131,18 @@ Expected: FAIL — `AttributeError: module 'mcp_fitbit_air.server' has no attrib
 Add to the existing imports in `src/mcp_fitbit_air/server.py`:
 
 ```python
-from datetime import date, timedelta
+import datetime as dt
+from datetime import timedelta
 
 from .baselines import compute_baseline
-from .fetch import fetch_metric, extract_value, point_date
+from .fetch import extract_value, fetch_metric
 from .mapping import METRICS, get_metric
 from .results import ResultState
 ```
+
+Import `datetime as dt` rather than `from datetime import date`: the
+`get_sleep_detail` tool added in Task 12 takes a parameter named `date`, and a
+module-level `date` import would be shadowed inside it.
 
 Then append:
 
@@ -3145,7 +3150,7 @@ Then append:
 MAX_INTRADAY_DAYS = 7
 
 
-def _intraday_series(ctx, metric, start: date, end: date, truncated: bool) -> ToolResult:
+def _intraday_series(ctx, metric, start: dt.date, end: dt.date, truncated: bool) -> ToolResult:
     exclusive_end = end + timedelta(days=1)
     filter_expr = (
         f'{metric.filter_field} >= "{start.isoformat()}T00:00:00Z" AND '
@@ -3302,6 +3307,10 @@ The two remaining tools, built together: both are small, and neither depends on 
 - Produces:
   - `server.get_sleep_detail(date: str)` tool
   - `server.query_raw(data_type: str, start_date: str, end_date: str | None = None, method: str = "list")` tool
+
+Note: `get_sleep_detail`'s parameter is named `date` because that is the clearest
+name for the tool's caller. Task 11 already imported `datetime as dt` rather than
+`from datetime import date` so that nothing is shadowed here.
 
 - [ ] **Step 1: Write the failing tests**
 
