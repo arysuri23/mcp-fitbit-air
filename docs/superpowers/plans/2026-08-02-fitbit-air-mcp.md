@@ -1805,14 +1805,22 @@ class ToolResult:
         return cls(state=ResultState.ERROR, message=message, remedy=remedy, meta=meta)
 
     def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"state": self.state.value}
+        """Serialise for the MCP stream.
+
+        Meta goes down FIRST and the authoritative fields are written over it.
+        `state` is not a named parameter on any constructor, so without this
+        ordering a caller could pass state="ok" as a meta kwarg and have an
+        error serialise as a success — defeating the one guarantee this module
+        exists to provide.
+        """
+        payload: dict[str, Any] = dict(self.meta)
+        payload["state"] = self.state.value
         if self.data is not None:
             payload["data"] = self.data
         if self.message is not None:
             payload["message"] = self.message
         if self.remedy is not None:
             payload["remedy"] = self.remedy
-        payload.update(self.meta)
         return payload
 ```
 
