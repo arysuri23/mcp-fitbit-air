@@ -1,0 +1,58 @@
+{
+  "body": {
+    "request": {
+      "range": {
+        "end": {
+          "day": 7,
+          "month": 1,
+          "year": 2026
+        },
+        "start": {
+          "day": 31,
+          "month": 12,
+          "year": 2025
+        }
+      },
+      "windowSizeDays": 1
+    },
+    "response": {
+      "error": {
+        "code": 400,
+        "details": [
+          {
+            "@type": "type.googleapis.com/google.rpc.BadRequest",
+            "fieldViolations": [
+              {
+                "description": "Invalid JSON payload received. Unknown name \"year\" at 'range.start': Cannot find field.",
+                "field": "range.start"
+              },
+              {
+                "description": "Invalid JSON payload received. Unknown name \"month\" at 'range.start': Cannot find field.",
+                "field": "range.start"
+              },
+              {
+                "description": "Invalid JSON payload received. Unknown name \"day\" at 'range.start': Cannot find field.",
+                "field": "range.start"
+              },
+              {
+                "description": "Invalid JSON payload received. Unknown name \"year\" at 'range.end': Cannot find field.",
+                "field": "range.end"
+              },
+              {
+                "description": "Invalid JSON payload received. Unknown name \"month\" at 'range.end': Cannot find field.",
+                "field": "range.end"
+              },
+              {
+                "description": "Invalid JSON payload received. Unknown name \"day\" at 'range.end': Cannot find field.",
+                "field": "range.end"
+              }
+            ]
+          }
+        ],
+        "message": "Invalid JSON payload received. Unknown name \"year\" at 'range.start': Cannot find field.\nInvalid JSON payload received. Unknown name \"month\" at 'range.start': Cannot find field.\nInvalid JSON payload received. Unknown name \"day\" at 'range.start': Cannot find field.\nInvalid JSON payload received. Unknown name \"year\" at 'range.end': Cannot find field.\nInvalid JSON payload received. Unknown name \"month\" at 'range.end': Cannot find field.\nInvalid JSON payload received. Unknown name \"day\" at 'range.end': Cannot find field.",
+        "status": "INVALID_ARGUMENT"
+      }
+    }
+  },
+  "status": 400
+}

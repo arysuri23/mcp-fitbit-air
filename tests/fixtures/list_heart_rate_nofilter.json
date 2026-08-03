@@ -1,0 +1,138 @@
+{
+  "body": {
+    "dataPoints": [
+      {
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "PASSIVELY_MEASURED"
+        },
+        "heartRate": {
+          "beatsPerMinute": "60",
+          "sampleTime": {
+            "civilTime": {
+              "date": {
+                "day": 7,
+                "month": 1,
+                "year": 2026
+              },
+              "time": {
+                "hours": 22,
+                "minutes": 60,
+                "seconds": 14
+              }
+            },
+            "physicalTime": "2026-01-08T02:25:14Z",
+            "utcOffset": "-14400s"
+          }
+        }
+      },
+      {
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "PASSIVELY_MEASURED"
+        },
+        "heartRate": {
+          "beatsPerMinute": "60",
+          "sampleTime": {
+            "civilTime": {
+              "date": {
+                "day": 7,
+                "month": 1,
+                "year": 2026
+              },
+              "time": {
+                "hours": 22,
+                "minutes": 60,
+                "seconds": 12
+              }
+            },
+            "physicalTime": "2026-01-08T02:25:12Z",
+            "utcOffset": "-14400s"
+          }
+        }
+      },
+      {
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "PASSIVELY_MEASURED"
+        },
+        "heartRate": {
+          "beatsPerMinute": "60",
+          "sampleTime": {
+            "civilTime": {
+              "date": {
+                "day": 7,
+                "month": 1,
+                "year": 2026
+              },
+              "time": {
+                "hours": 22,
+                "minutes": 60,
+                "seconds": 10
+              }
+            },
+            "physicalTime": "2026-01-08T02:25:10Z",
+            "utcOffset": "-14400s"
+          }
+        }
+      },
+      {
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "PASSIVELY_MEASURED"
+        },
+        "heartRate": {
+          "beatsPerMinute": "60",
+          "sampleTime": {
+            "civilTime": {
+              "date": {
+                "day": 7,
+                "month": 1,
+                "year": 2026
+              },
+              "time": {
+                "hours": 22,
+                "minutes": 60,
+                "seconds": 8
+              }
+            },
+            "physicalTime": "2026-01-08T02:25:08Z",
+            "utcOffset": "-14400s"
+          }
+        }
+      },
+      {
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "PASSIVELY_MEASURED"
+        },
+        "heartRate": {
+          "beatsPerMinute": "60",
+          "sampleTime": {
+            "civilTime": {
+              "date": {
+                "day": 7,
+                "month": 1,
+                "year": 2026
+              },
+              "time": {
+                "hours": 22,
+                "minutes": 60,
+                "seconds": 6
+              }
+            },
+            "physicalTime": "2026-01-08T02:25:06Z",
+            "utcOffset": "-14400s"
+          }
+        }
+      }
+    ],
+    "nextPageToken": "redacted-nextPageToken"
+  },
+  "status": 200
+}

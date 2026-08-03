@@ -1,0 +1,14 @@
+{
+  "body": {
+    "age": 30,
+    "membershipStartDate": {
+      "day": 2,
+      "month": 1,
+      "year": 2026
+    },
+    "name": "redacted-name",
+    "userConfiguredRunningStrideLengthMm": 900,
+    "userConfiguredWalkingStrideLengthMm": 700
+  },
+  "status": 200
+}
