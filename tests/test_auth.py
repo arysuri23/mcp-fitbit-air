@@ -71,3 +71,46 @@ def test_saved_token_round_trips(tmp_path):
     save_credentials(FakeCreds(), token_path)
 
     assert json.loads(token_path.read_text())["refresh_token"] == "r"
+
+
+def test_refresh_error_on_expired_token_with_testing_remedy(tmp_path, monkeypatch):
+    """RefreshError when refresh_token exists but refresh fails (e.g., 7-day expiry).
+
+    In 'Testing' publishing status, Google expires refresh tokens after 7 days.
+    This test simulates that scenario and verifies the error message guides the user.
+    """
+    from datetime import datetime, timedelta
+
+    from google.auth.exceptions import RefreshError
+    from google.oauth2.credentials import Credentials
+
+    cfg = make_config(tmp_path)
+    cfg.token_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Create a token with refresh_token but an expired access token
+    # (so creds.valid is False and refresh is actually attempted).
+    # expiry must be in the past to make valid == False.
+    past_time = (datetime.utcnow() - timedelta(hours=1)).isoformat() + "Z"
+    token_data = {
+        "token": "expired_access_token",
+        "refresh_token": "valid_refresh_token",
+        "expiry": past_time,
+        "scopes": [],
+    }
+    cfg.token_path.write_text(json.dumps(token_data))
+
+    # Patch Credentials.refresh to raise RefreshError (simulating 7-day expiry)
+    def mock_refresh(self, request):
+        raise RefreshError("Token has been revoked")
+
+    monkeypatch.setattr(Credentials, "refresh", mock_refresh)
+
+    with pytest.raises(AuthError) as exc:
+        load_credentials(cfg)
+
+    error_msg = str(exc.value)
+    assert "Testing" in error_msg, f"Expected 'Testing' in error message: {error_msg}"
+    assert "7 days" in error_msg or "7-day" in error_msg, (
+        f"Expected '7 days' or '7-day' in error message: {error_msg}"
+    )
+    assert "mcp-fitbit-air auth" in exc.value.remedy
