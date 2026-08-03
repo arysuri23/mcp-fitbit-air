@@ -46,12 +46,13 @@ class ToolResult:
         return cls(state=ResultState.ERROR, message=message, remedy=remedy, meta=meta)
 
     def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"state": self.state.value}
+        payload: dict[str, Any] = dict(self.meta)
+        # Authoritative fields always win over meta kwargs
+        payload["state"] = self.state.value
         if self.data is not None:
             payload["data"] = self.data
         if self.message is not None:
             payload["message"] = self.message
         if self.remedy is not None:
             payload["remedy"] = self.remedy
-        payload.update(self.meta)
         return payload

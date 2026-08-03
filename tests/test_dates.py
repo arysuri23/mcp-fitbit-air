@@ -65,3 +65,9 @@ def test_unparseable_input_raises_with_examples():
 
 def test_parsing_is_case_and_whitespace_insensitive():
     assert resolve_day("  YESTERDAY ", TZ, TODAY) == date(2026, 8, 1)
+
+
+def test_whole_range_expression_with_explicit_end_raises():
+    with pytest.raises(DateParseError) as exc:
+        resolve_range("last week", "2026-08-05", TZ, TODAY)
+    assert "already describes a whole range" in str(exc.value)
