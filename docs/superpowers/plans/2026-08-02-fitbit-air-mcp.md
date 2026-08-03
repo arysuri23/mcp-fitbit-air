@@ -4,13 +4,14 @@
 
 **Goal:** A local Python MCP server exposing five intent-shaped tools that let Claude answer questions about the author's Fitbit Air health data via the Google Health API.
 
-**Architecture:** A stdio MCP server built on FastMCP. Tool functions in `server.py` delegate to a layered core: `mapping.py` (metric registry — the single source of truth for data types, methods, units, and limits), `client.py` (all HTTP against `health.googleapis.com`, the seam where caching would later slot in), and `auth.py` (credential loading and silent refresh). Interactive OAuth lives in a separate CLI command, never in the server, because a stdio server cannot open a browser mid-request without corrupting the protocol stream.
+**Architecture:** A stdio MCP server built on the official MCP Python SDK. Tool functions in `server.py` delegate to a layered core: `mapping.py` (metric registry — the single source of truth for data types, methods, units, and limits), `client.py` (all HTTP against `health.googleapis.com`, the seam where caching would later slot in), and `auth.py` (credential loading and silent refresh). Interactive OAuth lives in a separate CLI command, never in the server, because a stdio server cannot open a browser mid-request without corrupting the protocol stream.
 
-**Tech Stack:** Python 3.11+, `mcp` (FastMCP), `google-auth`, `google-auth-oauthlib`, `requests` (via `google.auth.transport.requests.AuthorizedSession`), `pytest`, `responses` (HTTP mocking).
+**Tech Stack:** Python 3.11+, `mcp` 2.x, `google-auth`, `google-auth-oauthlib`, `requests` (via `google.auth.transport.requests.AuthorizedSession`), `pytest`, `responses` (HTTP mocking).
 
 ## Global Constraints
 
-- **Python 3.11+** — required for `datetime.UTC` and `zoneinfo`.
+- **Python 3.11+.** Verified environment: Python 3.13.14 at `.venv/`. The `mcp` package itself requires ≥3.10, so macOS system Python 3.9 cannot run this project.
+- **MCP SDK is `mcp` 2.x**, where the server class is `MCPServer`, imported as `from mcp.server.mcpserver import MCPServer`. The `FastMCP` name and the `mcp.server.fastmcp` module belong to the 1.x line and do not exist in 2.x. Everything else is unchanged: `@server.tool()` derives the schema from type hints and the description from the docstring, `run()` defaults to stdio transport, and returning a `dict` is serialised for you.
 - **Read-only scopes only.** No write scope may be requested anywhere in this project.
 - **No live API calls in the test suite.** Every test runs against committed fixtures.
 - **Fixtures are real health data** — the capture script must strip user IDs and offset dates before anything is committed.
@@ -346,7 +347,7 @@ version = "0.1.0"
 description = "MCP server exposing Google Fitbit Air health data via the Google Health API"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=1.2.0",
+    "mcp>=2.0.0",
     "google-auth>=2.28.0",
     "google-auth-oauthlib>=1.2.0",
     "requests>=2.31.0",
@@ -2000,7 +2001,7 @@ The first working tool, and the end-to-end smoke test for everything below it.
 - Produces:
   - `context.ServerContext` with `.client -> HealthClient` (lazily built), `.timezone -> ZoneInfo` (cached from profile, defaulting to UTC)
   - `context.get_context() -> ServerContext`
-  - `server.mcp` — the `FastMCP` instance
+  - `server.mcp` — the `MCPServer` instance
   - `server.run_server() -> None`
   - `server.get_profile_and_devices()` tool
   - `server.tool_guard` decorator translating `AuthError` / `ApiError` / `UnknownMetricError` / `DateParseError` into `ToolResult.error` payloads
@@ -2096,7 +2097,7 @@ def test_rate_limit_surfaces_wait_remedy(fake_context):
 
 def test_tool_never_raises_out_of_the_tool_boundary(fake_context):
     """An unexpected exception must still return a structured error, because a
-    raised exception inside a FastMCP tool is far less useful to Claude."""
+    raised exception inside an MCP tool is far less useful to Claude."""
     from mcp_fitbit_air.server import get_profile_and_devices
 
     fake_context.client.get_profile.side_effect = ValueError("unexpected")
@@ -2181,7 +2182,7 @@ def get_context() -> ServerContext:
 Create `src/mcp_fitbit_air/server.py`:
 
 ```python
-"""FastMCP server exposing Fitbit Air data.
+"""MCP server exposing Fitbit Air data.
 
 Never write to stdout from this process: stdout is the MCP protocol stream.
 Diagnostics go to stderr via logging.
@@ -2194,7 +2195,7 @@ import logging
 import sys
 from typing import Any, Callable
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from .auth import AuthError
 from .client import ApiError
@@ -2206,7 +2207,7 @@ from .results import ToolResult
 
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("fitbit-air")
+mcp = MCPServer("fitbit-air")
 
 
 def tool_guard(fn: Callable[..., ToolResult]) -> Callable[..., dict[str, Any]]:
@@ -3963,7 +3964,7 @@ Checked after writing, against `docs/superpowers/specs/2026-08-02-fitbit-air-mcp
 | Google Health API v4, not legacy | Tasks 1, 6 |
 | Single-user, config-driven for open-sourcing | Task 2 (env-only config), Task 13 (README) |
 | No local storage; `client.py` as the caching seam | Task 6 |
-| Python, FastMCP, stdio | Tasks 2, 7 |
+| Python, MCP SDK, stdio | Tasks 2, 7 |
 | Split-out `auth` CLI; server refreshes silently only | Task 3 |
 | Token at 0600, gitignored | Tasks 1, 3 |
 | Phase 0 spike gates everything; profile/devices first | Task 1 |

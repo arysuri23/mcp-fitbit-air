@@ -56,7 +56,7 @@ README as a model.
 | API | Google Health API v4 | Legacy Fitbit Web API dies 2026-09-30 |
 | Audience | Single-user, built to open-source later | Fast to use daily; config-driven avoids a later refactor |
 | Storage | None — live API calls | Account history is days old; a sync layer would serve no one |
-| Language | Python | MCP Python SDK (FastMCP) + `google-auth` / `google-auth-oauthlib` |
+| Language | Python | MCP Python SDK (`mcp` 2.x) + `google-auth` / `google-auth-oauthlib` |
 | Transport | stdio | Launched as a subprocess by Claude Code / Desktop |
 | Tool surface | Intent-shaped hybrid, 5 tools | Matches questions asked, not API structure |
 | Alerts | Out of scope for v1 | MCP is passive; a scheduled agent is a separate later layer |
@@ -76,7 +76,7 @@ Local Python MCP server over stdio. No hosting, no long-running callback server,
 daemon.
 
 ```
-Claude ──stdio──▶ server.py        FastMCP; 5 tool definitions
+Claude ──stdio──▶ server.py        MCPServer; 5 tool definitions
                       │
                       ▼
                   mapping.py       friendly metric name → Google dataType,

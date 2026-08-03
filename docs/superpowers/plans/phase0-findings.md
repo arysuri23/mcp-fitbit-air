@@ -5,10 +5,22 @@ Fitbit Air paired since:
 
 ## Q1: Publishing status and refresh token lifetime
 
-What happened when setting publishing status to "In production":
-Does the personal-use exception apply:
-Refresh token lifetime (7 days if stuck in Testing, else long-lived):
-**Decision:** proceed as designed / redesign needed because:
+**ANSWERED — 2026-08-02.**
+
+What happened when setting publishing status to "In production": published
+straight through. No verification demand, no CASA security assessment prompt,
+despite Google Health scopes being classified Restricted.
+
+Does the personal-use exception apply: yes, in effect — the app reached
+"In production" without a verification gate.
+
+Refresh token lifetime: long-lived. The app is out of Testing status, so the
+7-day test-user authorization expiry does not apply.
+
+**Decision:** proceed as designed. The riskiest assumption in the spec holds;
+no redesign needed. `auth.py`'s handling of revoked-token refresh failures
+(Task 3) stays as designed — it is still the right behaviour if the grant is
+ever revoked manually, it is simply no longer expected weekly.
 
 ## Q2: API reachability
 
