@@ -496,10 +496,15 @@ from dotenv import find_dotenv, load_dotenv
 
 DEFAULT_TOKEN_PATH = Path.home() / ".config" / "mcp-fitbit-air" / "token.json"
 
+# All five are required. profile/settings were absent in the Phase 0 spike's
+# first round, producing 403 ACCESS_TOKEN_SCOPE_INSUFFICIENT on the profile and
+# pairedDevices endpoints.
 SCOPES = [
     "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly",
     "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
     "https://www.googleapis.com/auth/googlehealth.sleep.readonly",
+    "https://www.googleapis.com/auth/googlehealth.profile.readonly",
+    "https://www.googleapis.com/auth/googlehealth.settings.readonly",
 ]
 
 
@@ -787,8 +792,28 @@ def load_credentials(config: Config) -> Credentials:
 
 def run_auth_flow(config: Config) -> None:
     """Interactive OAuth. CLI only — never called from the server."""
+    # Google grants only the scopes configured on the consent screen's Data
+    # Access page, which can be a subset of what we request. oauthlib treats any
+    # difference as fatal; relax that so we can inspect the grant and give a
+    # useful message instead of a raw "Scope has changed" traceback.
+    os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
     flow = InstalledAppFlow.from_client_config(config.client_config(), scopes=SCOPES)
     creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
+
+    granted = set(creds.scopes or [])
+    missing = [s for s in SCOPES if s not in granted]
+    if missing:
+        raise AuthError(
+            "Google did not grant these scopes: " + ", ".join(missing) + ". "
+            "Scopes must be added to the OAuth consent screen's Data Access "
+            "configuration, not only requested by the app.",
+            remedy=(
+                "Add the missing scopes at "
+                "https://console.cloud.google.com/auth/scopes, then re-run "
+                "`mcp-fitbit-air auth`."
+            ),
+        )
 
     if not creds.refresh_token:
         raise AuthError(
@@ -898,25 +923,34 @@ The single source of truth for how each friendly metric name maps onto the API. 
 **Interfaces:**
 - Consumes: nothing
 - Produces:
-  - `Metric` frozen dataclass: `name: str`, `data_type: str`, `method: str` (`"list"` or `"dailyRollUp"`), `unit: str`, `filter_field: str`, `value_key: str`, `warmup_nights: int`, `max_range_days: int`, `supports_intraday: bool`
+  - `Metric` frozen dataclass: `name: str`, `data_type: str`, `method: str` (`"list"` or `"dailyRollUp"`), `unit: str`, `date_of: Callable[[dict], date | None]`, `filter_member: str`, `filter_dialect: str` (`"civil_date"` or `"physical"`), `warmup_nights: int`, `max_range_days: int`, `supports_intraday: bool`, `extract: Callable[[dict], float | None]`
   - `METRICS: dict[str, Metric]`
   - `SUMMARY_METRICS: list[str]` — the seven metrics in `get_daily_summary`
   - `get_metric(name: str) -> Metric` — raises `UnknownMetricError`
+  - `coerce_number(value) -> float | None` and `dig(point, *path)` helpers
   - `UnknownMetricError(Exception)`
 
   Used by Tasks 6, 9, 10, 11.
+
+Every constant in this task was verified against the live API during Phase 0.
+Do not "simplify" the per-metric `filter_member` / `filter_dialect` pairs into a
+uniform scheme: the dialects genuinely differ per type, and choosing the wrong
+one returns HTTP 200 with zero data points rather than an error.
 
 - [ ] **Step 1: Write the failing test**
 
 Create `tests/test_mapping.py`:
 
 ```python
+from datetime import date
+
 import pytest
 
 from mcp_fitbit_air.mapping import (
     METRICS,
     SUMMARY_METRICS,
     UnknownMetricError,
+    coerce_number,
     get_metric,
 )
 
@@ -933,7 +967,6 @@ def test_unknown_metric_error_lists_valid_options():
 
     message = str(exc.value)
     assert "bogus" in message
-    # The error must be self-service: it names what IS valid.
     assert "steps" in message
     assert "hrv" in message
 
@@ -960,10 +993,11 @@ def test_every_metric_declares_a_supported_method():
         assert metric.method in {"list", "dailyRollUp"}, name
 
 
-def test_list_methods_declare_a_filter_field():
+def test_list_metrics_declare_a_filter_member_and_dialect():
     for name, metric in METRICS.items():
         if metric.method == "list":
-            assert metric.filter_field, f"{name} uses list but has no filter_field"
+            assert metric.filter_member, f"{name} uses list but declares no filter_member"
+            assert metric.filter_dialect in {"civil_date", "physical"}, name
 
 
 def test_heart_rate_range_limit_is_fourteen_days():
@@ -976,16 +1010,156 @@ def test_daily_metrics_cap_at_ninety_days():
     assert get_metric("hrv").max_range_days == 90
 
 
-def test_warmup_declared_for_derived_metrics():
-    """HRV and skin temperature need several nights before Fitbit computes them."""
-    assert get_metric("hrv").warmup_nights > 0
-    assert get_metric("skin_temperature_deviation").warmup_nights > 0
-    assert get_metric("steps").warmup_nights == 0
-
-
-def test_only_heart_rate_supports_intraday():
+def test_only_heart_rate_and_steps_support_intraday():
     intraday = {name for name, m in METRICS.items() if m.supports_intraday}
     assert intraday == {"heart_rate", "steps"}
+
+
+# --- The Phase 0 spike proved every value below. These tests encode the real
+# --- response shapes; a regression here means the API contract moved.
+
+
+def test_coerce_number_handles_json_strings():
+    """Integers arrive as JSON strings throughout the API."""
+    assert coerce_number("8630") == 8630.0
+    assert coerce_number(42) == 42.0
+    assert coerce_number(35.5) == 35.5
+    assert coerce_number(None) is None
+    assert coerce_number("not a number") is None
+
+
+def test_sleep_duration_reads_minutes_asleep_as_a_number():
+    point = {"sleep": {"summary": {"minutesAsleep": "385", "minutesAwake": "5"}}}
+    assert get_metric("sleep_duration").extract(point) == 385.0
+
+
+def test_sleep_duration_unit_is_minutes_not_seconds():
+    assert get_metric("sleep_duration").unit == "minutes"
+
+
+def test_resting_heart_rate_coerces_its_string_value():
+    point = {"dailyRestingHeartRate": {"beatsPerMinute": "58"}}
+    assert get_metric("resting_heart_rate").extract(point) == 58.0
+
+
+def test_hrv_reads_the_average_millisecond_field():
+    point = {
+        "dailyHeartRateVariability": {
+            "averageHeartRateVariabilityMilliseconds": 42.5,
+            "entropy": 1.0,
+        }
+    }
+    assert get_metric("hrv").extract(point) == 42.5
+
+
+def test_spo2_reads_average_percentage():
+    point = {"dailyOxygenSaturation": {"averagePercentage": 95.8, "lowerBoundPercentage": 93.7}}
+    assert get_metric("spo2").extract(point) == 95.8
+
+
+def test_skin_temperature_deviation_is_nightly_minus_baseline():
+    """The API returns no deviation field; it is derived."""
+    point = {
+        "dailySleepTemperatureDerivations": {
+            "nightlyTemperatureCelsius": 34.5,
+            "baselineTemperatureCelsius": 34.0,
+        }
+    }
+    assert get_metric("skin_temperature_deviation").extract(point) == pytest.approx(0.5)
+
+
+def test_skin_temperature_deviation_needs_both_halves():
+    point = {"dailySleepTemperatureDerivations": {"nightlyTemperatureCelsius": 34.5}}
+    assert get_metric("skin_temperature_deviation").extract(point) is None
+
+
+def test_steps_reads_rollup_count_sum():
+    point = {"steps": {"countSum": "8630"}}
+    assert get_metric("steps").extract(point) == 8630.0
+
+
+def test_active_zone_minutes_uses_fitbit_weighting():
+    """Fitbit counts cardio and peak double; fat burn single."""
+    point = {
+        "activeZoneMinutes": {
+            "sumInFatBurnHeartZone": "10",
+            "sumInCardioHeartZone": "5",
+            "sumInPeakHeartZone": "2",
+        }
+    }
+    assert get_metric("active_zone_minutes").extract(point) == 10 + 2 * (5 + 2)
+
+
+def test_active_zone_minutes_treats_absent_zones_as_zero():
+    point = {"activeZoneMinutes": {"sumInFatBurnHeartZone": "1"}}
+    assert get_metric("active_zone_minutes").extract(point) == 1.0
+
+
+def test_extract_returns_none_when_the_payload_is_missing():
+    for name in SUMMARY_METRICS:
+        assert get_metric(name).extract({}) is None, name
+
+
+def test_daily_metrics_filter_on_the_date_member():
+    """daily-* points carry a `date` object, not an `interval`."""
+    assert get_metric("hrv").filter_member == "daily_heart_rate_variability.date"
+    assert get_metric("hrv").filter_dialect == "civil_date"
+
+
+def test_sleep_filters_on_civil_end_time():
+    assert get_metric("sleep_duration").filter_member == "sleep.interval.civil_end_time"
+    assert get_metric("sleep_duration").filter_dialect == "civil_date"
+
+
+def test_heart_rate_filters_on_physical_time():
+    """Civil-time filters on heart-rate return 200 with zero points — silently
+    wrong. Physical time is the only reliable dialect for this type."""
+    assert get_metric("heart_rate").filter_member == "heart_rate.sample_time.physical_time"
+    assert get_metric("heart_rate").filter_dialect == "physical"
+
+
+def test_steps_filters_on_physical_interval_time():
+    assert get_metric("steps").filter_member == "steps.interval.start_time"
+    assert get_metric("steps").filter_dialect == "physical"
+
+
+def test_date_of_resolves_each_type_family():
+    cases = {
+        "hrv": {"dailyHeartRateVariability": {"date": {"year": 2026, "month": 8, "day": 1}}},
+        "steps": {"civilStartTime": {"date": {"year": 2026, "month": 8, "day": 1}}},
+        "heart_rate": {
+            "heartRate": {"sampleTime": {"civilTime": {"date": {"year": 2026, "month": 8, "day": 1}}}}
+        },
+    }
+    for name, point in cases.items():
+        assert get_metric(name).date_of(point) == date(2026, 8, 1), name
+
+
+def test_sleep_date_comes_from_the_end_instant_plus_offset():
+    """Sleep intervals carry NO civil times — only instants and offsets."""
+    point = {
+        "sleep": {
+            "interval": {"endTime": "2026-08-02T14:50:00Z", "endUtcOffset": "-14400s"}
+        }
+    }
+    # 14:50Z minus 4h is 10:50 local on the same day.
+    assert get_metric("sleep_duration").date_of(point) == date(2026, 8, 2)
+
+
+def test_sleep_date_uses_local_time_not_utc():
+    """A session ending 01:30Z with a -4h offset is still the previous evening
+    locally, and must be attributed to that day."""
+    point = {
+        "sleep": {
+            "interval": {"endTime": "2026-08-03T01:30:00Z", "endUtcOffset": "-14400s"}
+        }
+    }
+    assert get_metric("sleep_duration").date_of(point) == date(2026, 8, 2)
+
+
+def test_date_of_returns_none_for_unreadable_points():
+    for name in SUMMARY_METRICS:
+        assert get_metric(name).date_of({}) is None, name
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -1003,21 +1177,127 @@ Create `src/mcp_fitbit_air/mapping.py`:
 ```python
 """Metric registry: friendly name -> Google Health API specifics.
 
-Single source of truth. Data type identifiers, methods, and range limits all
-come from the Google Health API docs and were confirmed by the Phase 0 spike.
+Single source of truth. Every value here was verified against the live API by
+the Phase 0 spike; see docs/superpowers/plans/phase0-findings.md.
 
-Note that most metrics of interest support only `list`, not `dailyRollUp`.
-The `daily-*` data types are already pre-aggregated per day, so listing them
-over a range yields one point per day — which is what the summary needs.
+Three things about this API make a naive mapping wrong:
+
+1. Filters come in per-type dialects, and the WRONG ONE FAILS SILENTLY —
+   HTTP 200 with zero data points, indistinguishable from "no data". The
+   `daily-*` types filter on a `date` member; sleep filters on
+   `civil_end_time`; steps and heart-rate only work with physical
+   (RFC-3339) time.
+2. Integers arrive as JSON strings ("8630", "61"), so every value needs
+   coercion.
+3. Two metrics are not returned at all and must be derived: skin temperature
+   deviation (nightly minus baseline) and Active Zone Minutes (Fitbit weights
+   cardio and peak double).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from typing import Any
 
 
 class UnknownMetricError(Exception):
     """Raised when a caller names a metric that is not registered."""
+
+
+def coerce_number(value: Any) -> float | None:
+    """Coerce an API value to a float. Integers arrive as JSON strings."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def dig(point: dict, *path: str) -> Any:
+    """Walk a nested dict, returning None if any step is missing."""
+    node: Any = point
+    for key in path:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return node
+
+
+def _scalar(*path: str) -> Callable[[dict], float | None]:
+    return lambda point: coerce_number(dig(point, *path))
+
+
+def _civil_date_at(*path: str) -> Callable[[dict], date | None]:
+    """Read a {year, month, day} object at `path`."""
+
+    def read(point: dict) -> date | None:
+        node = dig(point, *path)
+        if not isinstance(node, dict):
+            return None
+        try:
+            return date(int(node["year"]), int(node["month"]), int(node["day"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    return read
+
+
+def _offset_date_at(
+    time_path: tuple[str, ...], offset_path: tuple[str, ...]
+) -> Callable[[dict], date | None]:
+    """Derive the local calendar date from an RFC-3339 instant plus a UTC
+    offset like "-14400s".
+
+    Sleep intervals carry no civil times at all — only startTime/endTime and
+    their offsets — so the local date has to be reconstructed.
+    """
+
+    def read(point: dict) -> date | None:
+        stamp = dig(point, *time_path)
+        if not isinstance(stamp, str):
+            return None
+        try:
+            moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        raw_offset = dig(point, *offset_path)
+        seconds = 0
+        if isinstance(raw_offset, str) and raw_offset.endswith("s"):
+            try:
+                seconds = int(raw_offset[:-1])
+            except ValueError:
+                seconds = 0
+        return (moment + timedelta(seconds=seconds)).date()
+
+    return read
+
+
+def _skin_temperature_deviation(point: dict) -> float | None:
+    """Derived: the API returns nightly and baseline, never the deviation."""
+    payload = point.get("dailySleepTemperatureDerivations") or {}
+    nightly = coerce_number(payload.get("nightlyTemperatureCelsius"))
+    baseline = coerce_number(payload.get("baselineTemperatureCelsius"))
+    if nightly is None or baseline is None:
+        return None
+    return round(nightly - baseline, 3)
+
+
+def _active_zone_minutes(point: dict) -> float | None:
+    """Fitbit's headline AZM counts cardio and peak double, fat burn single."""
+    payload = point.get("activeZoneMinutes")
+    if not isinstance(payload, dict):
+        return None
+    fat = coerce_number(payload.get("sumInFatBurnHeartZone")) or 0.0
+    cardio = coerce_number(payload.get("sumInCardioHeartZone")) or 0.0
+    peak = coerce_number(payload.get("sumInPeakHeartZone")) or 0.0
+    return fat + 2 * (cardio + peak)
 
 
 @dataclass(frozen=True)
@@ -1026,11 +1306,21 @@ class Metric:
     data_type: str
     method: str  # "list" | "dailyRollUp"
     unit: str
-    filter_field: str  # AIP-160 field path used for list date filtering
-    value_key: str  # key holding the value inside a data point
+    # AIP-160 member used for date filtering, and which literal format it needs.
+    filter_member: str
+    filter_dialect: str  # "civil_date" (bare YYYY-MM-DD) | "physical" (RFC-3339 Z)
     warmup_nights: int  # nights of wear before Fitbit computes this at all
     max_range_days: int
     supports_intraday: bool = False
+    extract: Callable[[dict], float | None] = field(
+        default=lambda _point: None, compare=False, repr=False
+    )
+    # Which local calendar day a data point belongs to. Not a single dotted
+    # path: daily-* types carry a civil {year,month,day}, rollups carry one at
+    # the top level, and sleep carries only an instant plus a UTC offset.
+    date_of: Callable[[dict], "date | None"] = field(
+        default=lambda _point: None, compare=False, repr=False
+    )
 
 
 METRICS: dict[str, Metric] = {
@@ -1038,84 +1328,108 @@ METRICS: dict[str, Metric] = {
         name="sleep_duration",
         data_type="sleep",
         method="list",
-        unit="seconds",
-        filter_field="sleep.interval.civil_end_time",
-        value_key="sleep",
+        unit="minutes",  # sleep.summary.minutesAsleep is minutes, not seconds
+        filter_member="sleep.interval.civil_end_time",
+        filter_dialect="civil_date",
         warmup_nights=0,
         max_range_days=90,
+        extract=_scalar("sleep", "summary", "minutesAsleep"),
+        # Sleep intervals have no civil times; derive the day from the
+        # end instant plus its offset, so a session is attributed to the
+        # morning you woke up.
+        date_of=_offset_date_at(
+            ("sleep", "interval", "endTime"), ("sleep", "interval", "endUtcOffset")
+        ),
     ),
     "resting_heart_rate": Metric(
         name="resting_heart_rate",
         data_type="daily-resting-heart-rate",
         method="list",
         unit="bpm",
-        filter_field="daily_resting_heart_rate.interval.civil_start_time",
-        value_key="dailyRestingHeartRate",
+        filter_member="daily_resting_heart_rate.date",
+        filter_dialect="civil_date",
         warmup_nights=1,
         max_range_days=90,
+        extract=_scalar("dailyRestingHeartRate", "beatsPerMinute"),
+        date_of=_civil_date_at("dailyRestingHeartRate", "date"),
     ),
     "hrv": Metric(
         name="hrv",
         data_type="daily-heart-rate-variability",
         method="list",
         unit="milliseconds",
-        filter_field="daily_heart_rate_variability.interval.civil_start_time",
-        value_key="dailyHeartRateVariability",
+        filter_member="daily_heart_rate_variability.date",
+        filter_dialect="civil_date",
         warmup_nights=3,
         max_range_days=90,
+        extract=_scalar(
+            "dailyHeartRateVariability", "averageHeartRateVariabilityMilliseconds"
+        ),
+        date_of=_civil_date_at("dailyHeartRateVariability", "date"),
     ),
     "spo2": Metric(
         name="spo2",
         data_type="daily-oxygen-saturation",
         method="list",
         unit="percent",
-        filter_field="daily_oxygen_saturation.interval.civil_start_time",
-        value_key="dailyOxygenSaturation",
+        filter_member="daily_oxygen_saturation.date",
+        filter_dialect="civil_date",
         warmup_nights=1,
         max_range_days=90,
+        extract=_scalar("dailyOxygenSaturation", "averagePercentage"),
+        date_of=_civil_date_at("dailyOxygenSaturation", "date"),
     ),
     "skin_temperature_deviation": Metric(
         name="skin_temperature_deviation",
         data_type="daily-sleep-temperature-derivations",
         method="list",
         unit="celsius_deviation",
-        filter_field="daily_sleep_temperature_derivations.interval.civil_start_time",
-        value_key="dailySleepTemperatureDerivations",
+        filter_member="daily_sleep_temperature_derivations.date",
+        filter_dialect="civil_date",
         warmup_nights=3,
         max_range_days=90,
+        extract=_skin_temperature_deviation,
+        date_of=_civil_date_at("dailySleepTemperatureDerivations", "date"),
     ),
     "steps": Metric(
         name="steps",
         data_type="steps",
         method="dailyRollUp",
         unit="count",
-        filter_field="steps.interval.civil_start_time",
-        value_key="steps",
+        filter_member="steps.interval.start_time",
+        filter_dialect="physical",  # civil filters return 0 points, silently
         warmup_nights=0,
         max_range_days=90,
         supports_intraday=True,
+        extract=_scalar("steps", "countSum"),
+        # Rollup points carry civilStartTime at the top level.
+        date_of=_civil_date_at("civilStartTime", "date"),
     ),
     "active_zone_minutes": Metric(
         name="active_zone_minutes",
         data_type="active-zone-minutes",
         method="dailyRollUp",
         unit="minutes",
-        filter_field="active_zone_minutes.interval.civil_start_time",
-        value_key="activeZoneMinutes",
+        filter_member="active_zone_minutes.interval.start_time",
+        filter_dialect="physical",
         warmup_nights=0,
         max_range_days=90,
+        extract=_active_zone_minutes,
+        date_of=_civil_date_at("civilStartTime", "date"),
     ),
     "heart_rate": Metric(
         name="heart_rate",
         data_type="heart-rate",
         method="dailyRollUp",
         unit="bpm",
-        filter_field="heart_rate.interval.start_time",
-        value_key="heartRate",
+        filter_member="heart_rate.sample_time.physical_time",
+        filter_dialect="physical",
         warmup_nights=0,
         # The API caps heart-rate queries at 14 days, unlike the 90-day default.
         max_range_days=14,
         supports_intraday=True,
+        extract=_scalar("heartRate", "beatsPerMinute"),
+        date_of=_civil_date_at("heartRate", "sampleTime", "civilTime", "date"),
     ),
 }
 
@@ -1149,11 +1463,7 @@ pytest tests/test_mapping.py -v
 
 Expected: PASS — 10 passed
 
-- [ ] **Step 5: Reconcile against Phase 0 findings**
-
-Open `docs/superpowers/plans/phase0-findings.md` and compare the `filter_field` and `value_key` values above against what the spike actually observed. Correct any mismatches in `mapping.py` now — the live API wins. Re-run the tests afterwards.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/mcp_fitbit_air/mapping.py tests/test_mapping.py
@@ -1521,6 +1831,7 @@ git commit -m "feat: add natural-language date parsing and four-state result con
 - Produces:
   - `HealthClient(credentials)` with methods:
     - `.get_profile() -> dict`
+    - `.get_settings() -> dict` (timezone lives here, not in profile)
     - `.get_paired_devices() -> list[dict]`
     - `.list_data_points(data_type: str, filter_expr: str | None = None, page_size: int = 1440) -> list[dict]`
     - `.daily_rollup(data_type: str, start: date, end: date, window_size_days: int = 1) -> list[dict]`
@@ -1554,7 +1865,7 @@ OUT = Path("tests/fixtures")
 # All real dates are shifted so that the most recent becomes this date.
 ANCHOR = date(2026, 1, 8)
 
-ID_KEYS = {"userId", "user", "name", "deviceId", "serialNumber", "dataSource"}
+ID_KEYS = {"userId", "user", "name", "deviceId", "serialNumber", "dataSource", "macAddress"}
 DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 
 
@@ -1670,6 +1981,7 @@ def fake_credentials():
 Create `tests/test_client.py`:
 
 ```python
+import json
 from datetime import date
 
 import pytest
@@ -1760,9 +2072,26 @@ def test_daily_rollup_posts_range_and_returns_points(client):
     points = client.daily_rollup("steps", date(2026, 8, 1), date(2026, 8, 2))
 
     assert points[0]["steps"]["count"] == 900
-    body = responses.calls[0].request.body.decode()
-    assert "range" in body
-    assert "windowSizeDays" in body
+    body = json.loads(responses.calls[0].request.body.decode())
+    # Nested CivilDateTime. Phase 0 proved ISO strings and bare year/month/day
+    # are both rejected with HTTP 400.
+    assert body["range"]["start"] == {"date": {"year": 2026, "month": 8, "day": 1}}
+    # Range is closed-open, so the inclusive end of Aug 2 is sent as Aug 3.
+    assert body["range"]["end"] == {"date": {"year": 2026, "month": 8, "day": 3}}
+    assert body["windowSizeDays"] == 1
+
+
+@responses.activate
+def test_get_settings_returns_timezone(client):
+    """Timezone lives in settings; profile has no timezone field at all."""
+    responses.add(
+        responses.GET,
+        f"{BASE}/users/me/settings",
+        json={"timeZone": "America/New_York", "utcOffset": "-14400s"},
+        status=200,
+    )
+
+    assert client.get_settings()["timeZone"] == "America/New_York"
 
 
 @responses.activate
@@ -1850,13 +2179,17 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 import requests
 from google.auth.transport.requests import AuthorizedSession
 
 logger = logging.getLogger(__name__)
+
+
+def _civil_date(value: date) -> dict[str, int]:
+    return {"year": value.year, "month": value.month, "day": value.day}
 
 BASE_URL = "https://health.googleapis.com/v4"
 MAX_RETRIES = 3
@@ -1956,6 +2289,10 @@ class HealthClient:
     def get_profile(self) -> dict[str, Any]:
         return self._request("GET", f"{BASE_URL}/users/me/profile")
 
+    def get_settings(self) -> dict[str, Any]:
+        """Settings, not profile, is where `timeZone` and `utcOffset` live."""
+        return self._request("GET", f"{BASE_URL}/users/me/settings")
+
     def get_paired_devices(self) -> list[dict[str, Any]]:
         payload = self._request("GET", f"{BASE_URL}/users/me/pairedDevices")
         return payload.get("pairedDevices", []) or payload.get("devices", [])
@@ -1989,12 +2326,18 @@ class HealthClient:
         window_size_days: int = 1,
     ) -> list[dict[str, Any]]:
         """Roll data up into per-day buckets. `end` is inclusive here; the API
-        range is closed-open, so we send end + 1 day."""
+        range is closed-open, so we send end + 1 day.
+
+        `range.start` / `range.end` are nested CivilDateTime objects. Phase 0
+        verified that ISO `startTime`/`endTime` strings and bare
+        `{year, month, day}` are both rejected with HTTP 400.
+        """
         url = f"{BASE_URL}/users/me/dataTypes/{data_type}/dataPoints:dailyRollUp"
+        exclusive_end = end + timedelta(days=1)
         body = {
             "range": {
-                "startTime": f"{start.isoformat()}T00:00:00Z",
-                "endTime": f"{end.isoformat()}T23:59:59Z",
+                "start": {"date": _civil_date(start)},
+                "end": {"date": _civil_date(exclusive_end)},
             },
             "windowSizeDays": window_size_days,
         }
@@ -2017,11 +2360,7 @@ pytest tests/test_client.py -v
 
 Expected: PASS — 9 passed
 
-- [ ] **Step 8: Reconcile the rollup range shape against Phase 0**
-
-The `daily_rollup` body above uses the ISO `startTime`/`endTime` shape. Check `phase0-findings.md`: if the API accepted only the nested civil `{"year":..,"month":..,"day":..}` shape, change `daily_rollup` to send that instead and update `test_daily_rollup_posts_range_and_returns_points` to match. Re-run the tests.
-
-- [ ] **Step 9: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/mcp_fitbit_air/client.py scripts/capture_fixtures.py tests/conftest.py tests/fixtures tests/test_client.py
@@ -2042,7 +2381,7 @@ The first working tool, and the end-to-end smoke test for everything below it.
 **Interfaces:**
 - Consumes: `Config` (Task 2), `load_credentials`/`AuthError` (Task 3), `HealthClient`/`ApiError` (Task 6), `ToolResult` (Task 5)
 - Produces:
-  - `context.ServerContext` with `.client -> HealthClient` (lazily built), `.timezone -> ZoneInfo` (cached from profile, defaulting to UTC)
+  - `context.ServerContext` with `.client -> HealthClient` (lazily built), `.timezone -> ZoneInfo` (cached from `settings.timeZone`, defaulting to UTC)
   - `context.get_context() -> ServerContext`
   - `server.mcp` — the `MCPServer` instance
   - `server.run_server() -> None`
@@ -2074,10 +2413,8 @@ def fake_context(monkeypatch):
 def test_profile_and_devices_returns_ok_with_battery(fake_context):
     from mcp_fitbit_air.server import get_profile_and_devices
 
-    fake_context.client.get_profile.return_value = {
-        "timezone": "America/New_York",
-        "age": 30,
-    }
+    fake_context.client.get_profile.return_value = {"age": 30}
+    fake_context.client.get_settings.return_value = {"timeZone": "America/New_York"}
     fake_context.client.get_paired_devices.return_value = [
         {"deviceVersion": "Fitbit Air", "batteryLevel": 82, "lastSyncTime": "2026-08-02T09:00:00Z"}
     ]
@@ -2086,13 +2423,15 @@ def test_profile_and_devices_returns_ok_with_battery(fake_context):
 
     assert result["state"] == "ok"
     assert result["data"]["devices"][0]["batteryLevel"] == 82
-    assert result["data"]["profile"]["timezone"] == "America/New_York"
+    # Timezone comes from settings; the profile response has no such field.
+    assert result["data"]["settings"]["timeZone"] == "America/New_York"
 
 
 def test_no_paired_devices_is_no_data_not_error(fake_context):
     from mcp_fitbit_air.server import get_profile_and_devices
 
-    fake_context.client.get_profile.return_value = {"timezone": "UTC"}
+    fake_context.client.get_profile.return_value = {"age": 30}
+    fake_context.client.get_settings.return_value = {"timeZone": "UTC"}
     fake_context.client.get_paired_devices.return_value = []
 
     result = get_profile_and_devices()
@@ -2173,7 +2512,7 @@ crashing the server before it can speak MCP.
 from __future__ import annotations
 
 import logging
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .auth import load_credentials
 from .client import ApiError, HealthClient
@@ -2199,13 +2538,18 @@ class ServerContext:
 
     @property
     def timezone(self) -> ZoneInfo:
-        """The user's profile timezone, used to resolve relative dates."""
+        """The user's timezone, used to resolve relative dates and to convert
+        local dates into the UTC instants that physical-time filters need.
+
+        This comes from `users/me/settings`, NOT the profile — Phase 0 confirmed
+        the profile response carries no timezone field of any kind.
+        """
         if self._timezone is None:
             try:
-                name = self.client.get_profile().get("timezone")
+                name = self.client.get_settings().get("timeZone")
                 self._timezone = ZoneInfo(name) if name else DEFAULT_TIMEZONE
-            except (ApiError, KeyError, ValueError) as exc:
-                logger.warning("Falling back to UTC; could not read profile timezone: %s", exc)
+            except (ApiError, KeyError, ValueError, ZoneInfoNotFoundError) as exc:
+                logger.warning("Falling back to UTC; could not read settings timeZone: %s", exc)
                 self._timezone = DEFAULT_TIMEZONE
         return self._timezone
 
@@ -2284,15 +2628,16 @@ def tool_guard(fn: Callable[..., ToolResult]) -> Callable[..., dict[str, Any]]:
 @mcp.tool()
 @tool_guard
 def get_profile_and_devices() -> ToolResult:
-    """Get the user's profile and their paired Fitbit devices.
+    """Get the user's profile, settings, and paired Fitbit devices.
 
-    Returns age, height, weight and timezone, plus each paired device's battery
-    level and last sync time. Useful on its own for "is my Fitbit synced?", and
-    a good first call when other tools return no data — a stale lastSyncTime
-    explains missing data better than any other signal.
+    Returns age and membership date, unit and timezone settings, and each paired
+    device's battery level and last sync time. Useful on its own for "is my
+    Fitbit synced?", and a good first call when other tools return no data — a
+    stale lastSyncTime explains missing data better than any other signal.
     """
     ctx = get_context()
     profile = ctx.client.get_profile()
+    settings = ctx.client.get_settings()
     devices = ctx.client.get_paired_devices()
 
     if not devices:
@@ -2300,9 +2645,10 @@ def get_profile_and_devices() -> ToolResult:
             "No paired devices found on this account. If the Fitbit Air was set up "
             "recently, open the Google Health app and confirm it has synced at least once.",
             profile=profile,
+            settings=settings,
         )
 
-    return ToolResult.ok({"profile": profile, "devices": devices})
+    return ToolResult.ok({"profile": profile, "settings": settings, "devices": devices})
 
 
 def run_server() -> None:
@@ -2477,9 +2823,9 @@ The layer between the raw client and the summary tool: fetch one metric over a r
 - Consumes: `Metric`/`get_metric` (Task 4), `HealthClient`/`ApiError` (Task 6), `ResultState` (Task 5)
 - Produces:
   - `MetricSeries` dataclass: `metric: Metric`, `by_day: dict[date, float]`, `state: ResultState`, `message: str | None`
-  - `fetch_metric(client, metric_name: str, start: date, end: date) -> MetricSeries`
-  - `extract_value(metric: Metric, point: dict) -> float | None`
-  - `point_date(point: dict) -> date | None`
+  - `fetch_metric(client, metric_name: str, start: date, end: date, tz: ZoneInfo) -> MetricSeries`
+  - `build_filter(metric: Metric, start: date, end: date, tz: ZoneInfo) -> str`
+  - `point_date(metric: Metric, point: dict) -> date | None`
 
   Used by Tasks 10, 11.
 
@@ -2489,54 +2835,59 @@ Create `tests/test_fetch.py`:
 
 ```python
 from datetime import date
+from zoneinfo import ZoneInfo
 from unittest.mock import Mock
 
 from mcp_fitbit_air.client import ApiError
-from mcp_fitbit_air.fetch import fetch_metric, point_date
+from mcp_fitbit_air.fetch import build_filter, fetch_metric, point_date
+from mcp_fitbit_air.mapping import get_metric
 from mcp_fitbit_air.results import ResultState
 
 START = date(2026, 8, 1)
 END = date(2026, 8, 3)
+TZ = ZoneInfo("America/New_York")
+
+
+def daily_point(payload_key, fields, day=(2026, 8, 1)):
+    y, m, d = day
+    return {payload_key: {"date": {"year": y, "month": m, "day": d}, **fields}}
 
 
 def test_list_metric_maps_points_onto_days():
     client = Mock()
     client.list_data_points.return_value = [
-        {
-            "dailyRestingHeartRate": {"value": 58},
-            "interval": {"civilStartTime": "2026-08-01T00:00:00"},
-        },
-        {
-            "dailyRestingHeartRate": {"value": 60},
-            "interval": {"civilStartTime": "2026-08-02T00:00:00"},
-        },
+        daily_point("dailyRestingHeartRate", {"beatsPerMinute": "58"}, (2026, 8, 1)),
+        daily_point("dailyRestingHeartRate", {"beatsPerMinute": "60"}, (2026, 8, 2)),
     ]
 
-    series = fetch_metric(client, "resting_heart_rate", START, END)
+    series = fetch_metric(client, "resting_heart_rate", START, END, TZ)
 
     assert series.state is ResultState.OK
-    assert series.by_day[date(2026, 8, 1)] == 58
-    assert series.by_day[date(2026, 8, 2)] == 60
+    assert series.by_day[date(2026, 8, 1)] == 58.0
+    assert series.by_day[date(2026, 8, 2)] == 60.0
 
 
 def test_rollup_metric_uses_daily_rollup_call():
     client = Mock()
     client.daily_rollup.return_value = [
-        {"steps": {"count": 9000}, "civilStartTime": "2026-08-01T00:00:00"}
+        {
+            "civilStartTime": {"date": {"year": 2026, "month": 8, "day": 1}},
+            "steps": {"countSum": "9000"},
+        }
     ]
 
-    series = fetch_metric(client, "steps", START, END)
+    series = fetch_metric(client, "steps", START, END, TZ)
 
     client.daily_rollup.assert_called_once()
     client.list_data_points.assert_not_called()
-    assert series.by_day[date(2026, 8, 1)] == 9000
+    assert series.by_day[date(2026, 8, 1)] == 9000.0
 
 
 def test_empty_response_for_zero_warmup_metric_is_no_data():
     client = Mock()
     client.daily_rollup.return_value = []
 
-    series = fetch_metric(client, "steps", START, END)
+    series = fetch_metric(client, "steps", START, END, TZ)
 
     assert series.state is ResultState.NO_DATA
     assert series.by_day == {}
@@ -2548,19 +2899,17 @@ def test_empty_response_for_warmup_metric_is_warming_up():
     client = Mock()
     client.list_data_points.return_value = []
 
-    series = fetch_metric(client, "hrv", date(2026, 8, 1), date(2026, 8, 2))
+    series = fetch_metric(client, "hrv", date(2026, 8, 1), date(2026, 8, 2), TZ)
 
     assert series.state is ResultState.WARMING_UP
     assert "3" in series.message
 
 
 def test_empty_response_over_a_long_window_is_no_data_not_warming_up():
-    """Over a window longer than the warm-up period, emptiness is genuinely
-    missing data — the band was not worn."""
     client = Mock()
     client.list_data_points.return_value = []
 
-    series = fetch_metric(client, "hrv", date(2026, 6, 1), date(2026, 8, 1))
+    series = fetch_metric(client, "hrv", date(2026, 6, 1), date(2026, 8, 1), TZ)
 
     assert series.state is ResultState.NO_DATA
 
@@ -2569,29 +2918,108 @@ def test_api_error_becomes_error_state_rather_than_raising():
     client = Mock()
     client.list_data_points.side_effect = ApiError("boom", status=500)
 
-    series = fetch_metric(client, "hrv", START, END)
+    series = fetch_metric(client, "hrv", START, END, TZ)
 
     assert series.state is ResultState.ERROR
     assert "boom" in series.message
 
 
-def test_sleep_duration_sums_multiple_sessions_in_one_day():
+def test_sleep_sums_multiple_sessions_in_one_day():
+    """A nap and a night's sleep on the same day must combine, not overwrite."""
+    client = Mock()
+    point = lambda mins: {
+        "sleep": {
+            "interval": {"endTime": "2026-08-01T12:00:00Z", "endUtcOffset": "-14400s"},
+            "summary": {"minutesAsleep": mins},
+        }
+    }
+    client.list_data_points.return_value = [point("385"), point("45")]
+
+    series = fetch_metric(client, "sleep_duration", START, END, TZ)
+
+    assert series.by_day[date(2026, 8, 1)] == 430.0
+
+
+def test_non_additive_metric_keeps_one_value_per_day():
     client = Mock()
     client.list_data_points.return_value = [
-        {"sleep": {"durationSeconds": 20000}, "interval": {"civilEndTime": "2026-08-01T07:00:00"}},
-        {"sleep": {"durationSeconds": 3000}, "interval": {"civilEndTime": "2026-08-01T15:00:00"}},
+        daily_point("dailyRestingHeartRate", {"beatsPerMinute": "58"}, (2026, 8, 1)),
+        daily_point("dailyRestingHeartRate", {"beatsPerMinute": "62"}, (2026, 8, 1)),
     ]
 
-    series = fetch_metric(client, "sleep_duration", START, END)
+    series = fetch_metric(client, "resting_heart_rate", START, END, TZ)
 
-    assert series.by_day[date(2026, 8, 1)] == 23000
+    assert series.by_day[date(2026, 8, 1)] == 62.0
 
 
-def test_point_date_reads_several_shapes():
-    assert point_date({"interval": {"civilStartTime": "2026-08-01T00:00:00"}}) == date(2026, 8, 1)
-    assert point_date({"civilStartTime": "2026-08-02T00:00:00"}) == date(2026, 8, 2)
-    assert point_date({"interval": {"startTime": "2026-08-03T04:00:00Z"}}) == date(2026, 8, 3)
-    assert point_date({"nothing": 1}) is None
+def test_skin_temperature_deviation_is_derived_per_day():
+    client = Mock()
+    client.list_data_points.return_value = [
+        daily_point(
+            "dailySleepTemperatureDerivations",
+            {"nightlyTemperatureCelsius": 34.5, "baselineTemperatureCelsius": 34.0},
+            (2026, 8, 1),
+        )
+    ]
+
+    series = fetch_metric(client, "skin_temperature_deviation", START, END, TZ)
+
+    assert series.by_day[date(2026, 8, 1)] == 0.5
+
+
+def test_unreadable_points_are_skipped_not_fatal():
+    client = Mock()
+    client.list_data_points.return_value = [
+        {"garbage": True},
+        daily_point("dailyRestingHeartRate", {"beatsPerMinute": "58"}, (2026, 8, 1)),
+    ]
+
+    series = fetch_metric(client, "resting_heart_rate", START, END, TZ)
+
+    assert series.by_day == {date(2026, 8, 1): 58.0}
+
+
+def test_point_date_delegates_to_the_metric_resolver():
+    assert point_date(
+        get_metric("hrv"),
+        {"dailyHeartRateVariability": {"date": {"year": 2026, "month": 8, "day": 1}}},
+    ) == date(2026, 8, 1)
+    assert point_date(
+        get_metric("steps"),
+        {"civilStartTime": {"date": {"year": 2026, "month": 8, "day": 2}}},
+    ) == date(2026, 8, 2)
+    assert point_date(get_metric("hrv"), {"nothing": 1}) is None
+
+
+# --- Filter construction. Getting the dialect wrong returns HTTP 200 with zero
+# --- points rather than an error, so these assertions are load-bearing.
+
+
+def test_civil_date_filter_uses_bare_dates_and_an_exclusive_end():
+    expr = build_filter(get_metric("hrv"), START, END, TZ)
+    assert expr == (
+        'daily_heart_rate_variability.date >= "2026-08-01" AND '
+        'daily_heart_rate_variability.date < "2026-08-04"'
+    )
+
+
+def test_sleep_filter_uses_civil_end_time():
+    expr = build_filter(get_metric("sleep_duration"), START, END, TZ)
+    assert expr.startswith('sleep.interval.civil_end_time >= "2026-08-01"')
+
+
+def test_physical_filter_uses_rfc3339_utc_instants():
+    """Local midnight in America/New_York is 04:00Z in August."""
+    expr = build_filter(get_metric("heart_rate"), START, START, TZ)
+    assert expr == (
+        'heart_rate.sample_time.physical_time >= "2026-08-01T04:00:00Z" AND '
+        'heart_rate.sample_time.physical_time < "2026-08-02T04:00:00Z"'
+    )
+
+
+def test_physical_filter_respects_a_different_timezone():
+    expr = build_filter(get_metric("heart_rate"), START, START, ZoneInfo("UTC"))
+    assert '"2026-08-01T00:00:00Z"' in expr
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -2609,16 +3037,23 @@ Create `src/mcp_fitbit_air/fetch.py`:
 ```python
 """Fetch one metric over a date range and reduce it to one value per day.
 
-Response shapes vary by data type, so extraction is deliberately forgiving:
-it probes a few known key names rather than assuming one. Anything it cannot
-read becomes a missing day, never a crash.
+Every shape here was verified against the live API during Phase 0. Two details
+matter more than they look:
+
+- Filter dialects differ per data type and the wrong one FAILS SILENTLY,
+  returning HTTP 200 with zero points. `build_filter` is the only place that
+  decides, and its tests pin the exact strings.
+- Physical-time filters compare against UTC instants, so local dates must be
+  converted through the user's timezone. Getting this wrong shifts every
+  intraday query by the UTC offset.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from .client import ApiError
 from .mapping import Metric, get_metric
@@ -2626,10 +3061,8 @@ from .results import ResultState
 
 logger = logging.getLogger(__name__)
 
-# Keys that may hold a scalar value inside a data point's payload.
-VALUE_KEYS = ("value", "count", "minutes", "durationSeconds", "bpm", "percent", "celsius")
-# Keys that may hold a timestamp, in order of preference.
-TIME_KEYS = ("civilStartTime", "civilEndTime", "startTime", "endTime")
+# Metrics whose same-day values should be summed rather than overwritten.
+ADDITIVE_UNITS = {"minutes", "count"}
 
 
 @dataclass
@@ -2640,53 +3073,43 @@ class MetricSeries:
     message: str | None = None
 
 
-def point_date(point: dict) -> date | None:
-    """Pull a date out of a data point, tolerating several envelope shapes."""
-    candidates = [point, point.get("interval") or {}]
-    for holder in candidates:
-        if not isinstance(holder, dict):
-            continue
-        for key in TIME_KEYS:
-            raw = holder.get(key)
-            if isinstance(raw, str):
-                try:
-                    return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
-                except ValueError:
-                    continue
-            if isinstance(raw, dict) and "year" in raw:
-                try:
-                    return date(raw["year"], raw["month"], raw["day"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-    return None
+def point_date(metric: Metric, point: dict) -> date | None:
+    """Read this point's local calendar day.
+
+    Delegates to the metric's own resolver: the date lives in a different place
+    for every type family, and sleep has to derive it from an instant plus an
+    offset because its interval carries no civil times.
+    """
+    return metric.date_of(point)
 
 
-def extract_value(metric: Metric, point: dict) -> float | None:
-    """Pull the scalar value for `metric` out of a data point."""
-    payload = point.get(metric.value_key)
-    if payload is None:
-        # dailyRollUp responses key the payload by the data type's own name.
-        payload = point.get(metric.data_type.replace("-", "_"))
-    if isinstance(payload, (int, float)):
-        return float(payload)
-    if isinstance(payload, dict):
-        for key in VALUE_KEYS:
-            value = payload.get(key)
-            if isinstance(value, (int, float)):
-                return float(value)
-    return None
+def _utc_instant(day: date, tz: ZoneInfo) -> str:
+    """Local midnight on `day`, expressed as an RFC-3339 UTC instant."""
+    local = datetime.combine(day, time.min, tzinfo=tz)
+    return local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_filter(metric: Metric, start: date, end: date, tz: ZoneInfo) -> str:
+    """Build the AIP-160 filter for this metric. `end` is inclusive; the API
+    range is closed-open, so the emitted upper bound is the following day."""
+    exclusive_end = end + timedelta(days=1)
+    member = metric.filter_member
+
+    if metric.filter_dialect == "physical":
+        lower = _utc_instant(start, tz)
+        upper = _utc_instant(exclusive_end, tz)
+    else:  # "civil_date"
+        lower = start.isoformat()
+        upper = exclusive_end.isoformat()
+
+    return f'{member} >= "{lower}" AND {member} < "{upper}"'
 
 
 def _accumulate(series: MetricSeries, points: list[dict]) -> None:
-    """Sum values per day for additive metrics; take the last value otherwise.
-
-    Sleep is the additive case that matters: a nap and a night's sleep on the
-    same day should combine rather than one overwriting the other.
-    """
-    additive = series.metric.unit in {"seconds", "count", "minutes"}
+    additive = series.metric.unit in ADDITIVE_UNITS
     for point in points:
-        day = point_date(point)
-        value = extract_value(series.metric, point)
+        day = point_date(series.metric, point)
+        value = series.metric.extract(point)
         if day is None or value is None:
             continue
         if additive and day in series.by_day:
@@ -2695,7 +3118,9 @@ def _accumulate(series: MetricSeries, points: list[dict]) -> None:
             series.by_day[day] = value
 
 
-def fetch_metric(client, metric_name: str, start: date, end: date) -> MetricSeries:
+def fetch_metric(
+    client, metric_name: str, start: date, end: date, tz: ZoneInfo
+) -> MetricSeries:
     """Fetch one metric. Never raises for API problems — returns ERROR state."""
     metric = get_metric(metric_name)
     series = MetricSeries(metric=metric)
@@ -2704,14 +3129,9 @@ def fetch_metric(client, metric_name: str, start: date, end: date) -> MetricSeri
         if metric.method == "dailyRollUp":
             points = client.daily_rollup(metric.data_type, start, end)
         else:
-            # The API range is closed-open, so the exclusive end is the day
-            # after the inclusive `end`.
-            exclusive_end = end + timedelta(days=1)
-            filter_expr = (
-                f'{metric.filter_field} >= "{start.isoformat()}" AND '
-                f'{metric.filter_field} < "{exclusive_end.isoformat()}"'
+            points = client.list_data_points(
+                metric.data_type, filter_expr=build_filter(metric, start, end, tz)
             )
-            points = client.list_data_points(metric.data_type, filter_expr=filter_expr)
     except ApiError as exc:
         series.state = ResultState.ERROR
         series.message = str(exc)
@@ -2767,7 +3187,7 @@ The workhorse. One call should answer most questions.
 **Interfaces:**
 - Consumes: `fetch_metric`/`MetricSeries` (Task 9), `SUMMARY_METRICS`/`get_metric` (Task 4), `compute_baseline` (Task 8), `resolve_range` (Task 5), `ToolResult` (Task 5), `get_context` (Task 7)
 - Produces:
-  - `summary.build_summary(client, start: date, end: date, metric_names: list[str]) -> dict`
+  - `summary.build_summary(client, start: date, end: date, metric_names: list[str], tz: ZoneInfo) -> dict`
   - `summary.MAX_SUMMARY_DAYS = 90`
   - `server.get_daily_summary(start_date: str, end_date: str | None = None)` tool
 
@@ -2778,6 +3198,7 @@ Create `tests/test_summary.py`:
 ```python
 from datetime import date
 from unittest.mock import Mock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -2785,6 +3206,9 @@ from mcp_fitbit_air.results import ResultState
 from mcp_fitbit_air.summary import MAX_SUMMARY_DAYS, build_summary
 from mcp_fitbit_air.fetch import MetricSeries
 from mcp_fitbit_air.mapping import get_metric
+
+
+TZ = ZoneInfo("UTC")
 
 
 def series(name, by_day, state=ResultState.OK, message=None):
@@ -2797,16 +3221,16 @@ def test_summary_has_one_row_per_day_in_range():
     fake = {
         "steps": series("steps", {date(2026, 8, 1): 9000, date(2026, 8, 2): 11000}),
     }
-    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=lambda c, n, s, e: fake[n]):
-        result = build_summary(Mock(), date(2026, 8, 1), date(2026, 8, 3), ["steps"])
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=lambda c, n, s, e, tz: fake[n]):
+        result = build_summary(Mock(), date(2026, 8, 1), date(2026, 8, 3), ["steps"], TZ)
 
     assert [row["date"] for row in result["days"]] == ["2026-08-01", "2026-08-02", "2026-08-03"]
 
 
 def test_values_carry_units_and_baselines():
     fake = {"steps": series("steps", {date(2026, 8, 1): 9000, date(2026, 8, 2): 11000})}
-    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=lambda c, n, s, e: fake[n]):
-        result = build_summary(Mock(), date(2026, 8, 1), date(2026, 8, 2), ["steps"])
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=lambda c, n, s, e, tz: fake[n]):
+        result = build_summary(Mock(), date(2026, 8, 1), date(2026, 8, 2), ["steps"], TZ)
 
     cell = result["days"][0]["metrics"]["steps"]
     assert cell["value"] == 9000
@@ -2817,8 +3241,8 @@ def test_values_carry_units_and_baselines():
 
 def test_day_with_no_value_is_marked_no_data_not_zero():
     fake = {"steps": series("steps", {date(2026, 8, 1): 9000})}
-    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=lambda c, n, s, e: fake[n]):
-        result = build_summary(Mock(), date(2026, 8, 1), date(2026, 8, 2), ["steps"])
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=lambda c, n, s, e, tz: fake[n]):
+        result = build_summary(Mock(), date(2026, 8, 1), date(2026, 8, 2), ["steps"], TZ)
 
     cell = result["days"][1]["metrics"]["steps"]
     assert cell["state"] == "no_data"
@@ -2830,8 +3254,8 @@ def test_one_failing_metric_does_not_sink_the_others():
         "steps": series("steps", {date(2026, 8, 1): 9000}),
         "hrv": series("hrv", {}, state=ResultState.ERROR, message="boom"),
     }
-    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=lambda c, n, s, e: fake[n]):
-        result = build_summary(Mock(), date(2026, 8, 1), date(2026, 8, 1), ["steps", "hrv"])
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=lambda c, n, s, e, tz: fake[n]):
+        result = build_summary(Mock(), date(2026, 8, 1), date(2026, 8, 1), ["steps", "hrv"], TZ)
 
     metrics = result["days"][0]["metrics"]
     assert metrics["steps"]["value"] == 9000
@@ -2840,8 +3264,8 @@ def test_one_failing_metric_does_not_sink_the_others():
 
 def test_warming_up_metric_is_reported_per_day():
     fake = {"hrv": series("hrv", {}, state=ResultState.WARMING_UP, message="needs 3 nights")}
-    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=lambda c, n, s, e: fake[n]):
-        result = build_summary(Mock(), date(2026, 8, 1), date(2026, 8, 1), ["hrv"])
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=lambda c, n, s, e, tz: fake[n]):
+        result = build_summary(Mock(), date(2026, 8, 1), date(2026, 8, 1), ["hrv"], TZ)
 
     cell = result["days"][0]["metrics"]["hrv"]
     assert cell["state"] == "warming_up"
@@ -2853,8 +3277,8 @@ def test_metric_level_problems_are_summarised_at_the_top():
         "steps": series("steps", {date(2026, 8, 1): 9000}),
         "hrv": series("hrv", {}, state=ResultState.ERROR, message="boom"),
     }
-    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=lambda c, n, s, e: fake[n]):
-        result = build_summary(Mock(), date(2026, 8, 1), date(2026, 8, 1), ["steps", "hrv"])
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=lambda c, n, s, e, tz: fake[n]):
+        result = build_summary(Mock(), date(2026, 8, 1), date(2026, 8, 1), ["steps", "hrv"], TZ)
 
     assert result["metric_status"]["hrv"]["state"] == "error"
     assert result["metric_status"]["steps"]["state"] == "ok"
@@ -2862,7 +3286,7 @@ def test_metric_level_problems_are_summarised_at_the_top():
 
 def test_range_longer_than_the_cap_is_rejected():
     with pytest.raises(ValueError) as exc:
-        build_summary(Mock(), date(2026, 1, 1), date(2026, 12, 31), ["steps"])
+        build_summary(Mock(), date(2026, 1, 1), date(2026, 12, 31), ["steps"], TZ)
     assert str(MAX_SUMMARY_DAYS) in str(exc.value)
 ```
 
@@ -2890,6 +3314,7 @@ from __future__ import annotations
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
+from zoneinfo import ZoneInfo
 
 from .baselines import compute_baseline
 from .fetch import MetricSeries, fetch_metric
@@ -2905,7 +3330,9 @@ def _days_in(start: date, end: date) -> list[date]:
     return [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
 
 
-def build_summary(client, start: date, end: date, metric_names: list[str]) -> dict:
+def build_summary(
+    client, start: date, end: date, metric_names: list[str], tz: ZoneInfo
+) -> dict:
     span = (end - start).days + 1
     if span > MAX_SUMMARY_DAYS:
         raise ValueError(
@@ -2916,7 +3343,7 @@ def build_summary(client, start: date, end: date, metric_names: list[str]) -> di
 
     with ThreadPoolExecutor(max_workers=len(metric_names) or 1) as pool:
         series_list: list[MetricSeries] = list(
-            pool.map(lambda name: fetch_metric(client, name, start, end), metric_names)
+            pool.map(lambda name: fetch_metric(client, name, start, end, tz), metric_names)
         )
     series_by_name = {s.metric.name: s for s in series_list}
 
@@ -3004,7 +3431,7 @@ def get_daily_summary(start_date: str, end_date: str | None = None) -> ToolResul
     ctx = get_context()
     start, end = resolve_range(start_date, end_date, ctx.timezone)
     try:
-        summary = build_summary(ctx.client, start, end, SUMMARY_METRICS)
+        summary = build_summary(ctx.client, start, end, SUMMARY_METRICS, ctx.timezone)
     except ValueError as exc:
         return ToolResult.error(str(exc))
 
@@ -3087,7 +3514,7 @@ def test_daily_series_returns_points_with_baseline(fake_context, monkeypatch):
     monkeypatch.setattr(
         server,
         "fetch_metric",
-        lambda c, n, s, e: MetricSeries(
+        lambda c, n, s, e, tz: MetricSeries(
             metric=get_metric("hrv"),
             by_day={date(2026, 8, 1): 55.0, date(2026, 8, 2): 42.0},
         ),
@@ -3149,7 +3576,7 @@ def test_warming_up_state_is_propagated(fake_context, monkeypatch):
     monkeypatch.setattr(
         server,
         "fetch_metric",
-        lambda c, n, s, e: MetricSeries(
+        lambda c, n, s, e, tz: MetricSeries(
             metric=get_metric("hrv"),
             by_day={},
             state=ResultState.WARMING_UP,
@@ -3179,7 +3606,7 @@ import datetime as dt
 from datetime import timedelta
 
 from .baselines import compute_baseline
-from .fetch import extract_value, fetch_metric
+from .fetch import build_filter, fetch_metric
 from .mapping import METRICS, get_metric
 from .results import ResultState
 ```
@@ -3194,26 +3621,34 @@ Then append:
 MAX_INTRADAY_DAYS = 7
 
 
+def _reading_time(point: dict) -> str | None:
+    """Best-effort physical timestamp for one intraday reading."""
+    for holder in (point.get("heartRate") or {}, point.get("steps") or {}, point):
+        if not isinstance(holder, dict):
+            continue
+        sample = holder.get("sampleTime")
+        if isinstance(sample, dict) and isinstance(sample.get("physicalTime"), str):
+            return sample["physicalTime"]
+        interval = holder.get("interval")
+        if isinstance(interval, dict) and isinstance(interval.get("startTime"), str):
+            return interval["startTime"]
+    return None
+
+
 def _intraday_series(ctx, metric, start: dt.date, end: dt.date, truncated: bool) -> ToolResult:
-    exclusive_end = end + timedelta(days=1)
-    filter_expr = (
-        f'{metric.filter_field} >= "{start.isoformat()}T00:00:00Z" AND '
-        f'{metric.filter_field} < "{exclusive_end.isoformat()}T00:00:00Z"'
+    # build_filter owns the per-type dialect choice; the wrong one returns
+    # HTTP 200 with zero points rather than an error.
+    points = ctx.client.list_data_points(
+        metric.data_type,
+        filter_expr=build_filter(metric, start, end, ctx.timezone),
     )
-    points = ctx.client.list_data_points(metric.data_type, filter_expr=filter_expr)
 
     readings = []
     for point in points:
-        value = extract_value(metric, point)
+        value = metric.extract(point)
         if value is None:
             continue
-        timestamp = None
-        holder = point.get("interval") or point
-        for key in ("startTime", "civilStartTime"):
-            if isinstance(holder.get(key), str):
-                timestamp = holder[key]
-                break
-        readings.append({"time": timestamp, "value": value})
+        readings.append({"time": _reading_time(point), "value": value})
 
     meta = {}
     if truncated:
@@ -3293,7 +3728,7 @@ def get_metric_series(
             f"for {metric}. Request a narrower range."
         )
 
-    series = fetch_metric(ctx.client, metric, start, end)
+    series = fetch_metric(ctx.client, metric, start, end, ctx.timezone)
 
     if series.state is ResultState.ERROR:
         return ToolResult.error(series.message or "Failed to fetch metric.")
@@ -3513,6 +3948,7 @@ Add to the existing imports:
 
 ```python
 from .dates import resolve_day
+from .mapping import coerce_number
 ```
 
 Then append:
@@ -3536,22 +3972,24 @@ def get_sleep_detail(date: str) -> ToolResult:
     ctx = get_context()
     day = resolve_day(date, ctx.timezone)
     metric = get_metric("sleep_duration")
-
-    exclusive_end = day + timedelta(days=1)
-    filter_expr = (
-        f'{metric.filter_field} >= "{day.isoformat()}" AND '
-        f'{metric.filter_field} < "{exclusive_end.isoformat()}"'
+    points = ctx.client.list_data_points(
+        metric.data_type,
+        filter_expr=build_filter(metric, day, day, ctx.timezone),
     )
-    points = ctx.client.list_data_points(metric.data_type, filter_expr=filter_expr)
 
     sessions = []
     for point in points:
         payload = point.get("sleep") or {}
+        summary = payload.get("summary") or {}
         sessions.append(
             {
-                "duration_seconds": payload.get("durationSeconds"),
-                "levels": payload.get("levels", []),
-                "interval": point.get("interval"),
+                "minutes_asleep": coerce_number(summary.get("minutesAsleep")),
+                "minutes_awake": coerce_number(summary.get("minutesAwake")),
+                "minutes_to_fall_asleep": coerce_number(summary.get("minutesToFallAsleep")),
+                "stages_summary": summary.get("stagesSummary", []),
+                "stages": payload.get("stages", []),
+                "is_main_sleep": (payload.get("metadata") or {}).get("mainSleep"),
+                "interval": payload.get("interval"),
             }
         )
 
@@ -3711,6 +4149,7 @@ def test_tool_returns_valid_state_on_empty_data(fake_context, name, call):
     fake_context.client.list_data_points.return_value = []
     fake_context.client.daily_rollup.return_value = []
     fake_context.client.get_profile.return_value = {}
+    fake_context.client.get_settings.return_value = {}
     fake_context.client.get_paired_devices.return_value = []
 
     result = call()
@@ -3724,6 +4163,7 @@ def test_tool_returns_error_state_on_api_failure(fake_context, name, call):
     fake_context.client.list_data_points.side_effect = boom
     fake_context.client.daily_rollup.side_effect = boom
     fake_context.client.get_profile.side_effect = boom
+    fake_context.client.get_settings.side_effect = boom
     fake_context.client.get_paired_devices.side_effect = boom
 
     result = call()
@@ -3755,6 +4195,7 @@ def test_tool_never_raises(fake_context, name, call):
     fake_context.client.list_data_points.side_effect = RuntimeError("chaos")
     fake_context.client.daily_rollup.side_effect = RuntimeError("chaos")
     fake_context.client.get_profile.side_effect = RuntimeError("chaos")
+    fake_context.client.get_settings.side_effect = RuntimeError("chaos")
     fake_context.client.get_paired_devices.side_effect = RuntimeError("chaos")
 
     result = call()  # must not raise
