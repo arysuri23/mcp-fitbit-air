@@ -19,7 +19,7 @@
 - **Config comes only from environment variables.** No client ID, secret, or project ID may be hardcoded in any source file.
 - **API base:** `https://health.googleapis.com/v4`
 - **Query range limits (API-imposed):** 14 days for `heart-rate`, `active-minutes`, `total-calories`, `calories-in-heart-rate-zone`; 90 days for all other data types.
-- **Tools are validated against an output schema derived from their return annotation.** `tool_guard` must reset the wrapper's `__annotations__["return"]` to `dict[str, Any]` after `functools.wraps`, or the SDK validates the returned dict against a `ToolResult` schema and every call fails. Unit tests that call a tool function directly do NOT exercise this — a test must go through `mcp.call_tool(...)`.
+- **Tools are validated against an output schema the SDK derives from `inspect.signature`.** `functools.wraps` sets `wrapper.__wrapped__`, and `inspect.signature` follows `__wrapped__` unless the wrapper carries its own `__signature__` — so overwriting `__annotations__` alone does NOT work (this was tried and disproven against the installed SDK). `tool_guard` must set `wrapper.__signature__` to the wrapped function's signature with the return annotation replaced by `dict[str, Any]`, copying parameters through unchanged so later tools' input schemas survive. Otherwise the SDK validates each returned dict against a `ToolResult` schema requiring a `meta` key that `to_dict()` deliberately flattens away, and every call fails. **Unit tests that call a tool function directly cannot see this** — a tool test must go through `await mcp.call_tool(...)`.
 - **Never emit to stdout** anywhere in the server process — stdout is the MCP protocol stream. All diagnostics go to stderr via `logging`.
 
 ---
@@ -2609,6 +2609,7 @@ Diagnostics go to stderr via logging.
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 import sys
 from typing import Any, Callable
@@ -2653,13 +2654,27 @@ def tool_guard(fn: Callable[..., ToolResult]) -> Callable[..., dict[str, Any]]:
             logger.exception("Unexpected error in %s", fn.__name__)
             return ToolResult.error(f"Unexpected error in {fn.__name__}: {exc}").to_dict()
 
-    # functools.wraps copies __annotations__ from `fn`, whose return annotation
-    # is ToolResult — which would clobber the wrapper's own `-> dict`. The MCP
-    # SDK builds each tool's OUTPUT SCHEMA from that annotation and validates
-    # the returned value against it, so leaving it as ToolResult makes every
-    # tool call fail validation: to_dict() flattens `meta` into the top level,
-    # while a ToolResult schema requires a `meta` object. Restore the real
-    # return type so the SDK sees what the wrapper actually returns.
+    # functools.wraps copies `fn`'s `-> ToolResult` annotation over the
+    # wrapper's own `-> dict[str, Any]` AND sets `wrapper.__wrapped__ = fn`.
+    # The second part is the one that bites: the SDK builds each tool's schema
+    # with `inspect.signature(tool_fn, eval_str=True)`, and inspect.signature
+    # follows `__wrapped__` unless the object carries its own `__signature__`.
+    # So it inspects `fn`, recovers `-> ToolResult`, builds an output schema
+    # requiring a `meta` key — which `to_dict()` deliberately flattens away —
+    # and every call fails output validation even though the tool succeeded.
+    #
+    # Overwriting `__annotations__` alone does NOT fix this: inspect.signature
+    # never reads it once it has unwrapped past the wrapper. Setting
+    # `__signature__` makes the wrapper self-describing so unwrapping stops
+    # here. Parameters are copied through unchanged — later tools take real
+    # arguments that must still appear in the input schema — and only the
+    # return annotation is replaced. eval_str=True resolves the string
+    # annotations that `from __future__ import annotations` produces.
+    #
+    # This is invisible to tests that call the wrapped function directly in
+    # Python; only a call through `mcp.call_tool(...)` exercises it.
+    original_signature = inspect.signature(fn, eval_str=True)
+    wrapper.__signature__ = original_signature.replace(return_annotation=dict[str, Any])
     wrapper.__annotations__ = {
         **getattr(fn, "__annotations__", {}),
         "return": dict[str, Any],
