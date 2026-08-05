@@ -7,6 +7,7 @@ Diagnostics go to stderr via logging.
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 import sys
 from typing import Any, Callable
@@ -50,6 +51,42 @@ def tool_guard(fn: Callable[..., ToolResult]) -> Callable[..., dict[str, Any]]:
         except Exception as exc:  # noqa: BLE001 - deliberate boundary
             logger.exception("Unexpected error in %s", fn.__name__)
             return ToolResult.error(f"Unexpected error in {fn.__name__}: {exc}").to_dict()
+
+    # `functools.wraps` copies `fn`'s `__annotations__` (so `-> ToolResult`
+    # silently overwrites `wrapper`'s own `-> dict[str, Any]`) AND sets
+    # `wrapper.__wrapped__ = fn`. That second part is the one that actually
+    # bites: the MCP SDK builds each tool's schema by calling
+    # `inspect.signature(tool_fn, eval_str=True)`, and `inspect.signature`
+    # follows `__wrapped__` by default whenever the object has no
+    # `__signature__` of its own — so it skips straight past `wrapper` and
+    # inspects `fn` instead, recovering `fn`'s original `-> ToolResult`
+    # return annotation no matter what `wrapper.__annotations__` says.
+    # (Confirmed directly: overwriting `wrapper.__annotations__` alone does
+    # NOT change what `inspect.signature(wrapper)` reports, because it never
+    # looks at `wrapper.__annotations__` once it has unwrapped past it.) The
+    # SDK then builds the output schema from the `ToolResult` dataclass
+    # (requires `state` AND a nested `meta` key) and validates `wrapper`'s
+    # actual return value — a dict flattened by `ToolResult.to_dict()`, with
+    # no `meta` key by design — against that schema. Every call to every
+    # `tool_guard`-wrapped tool then fails SDK output validation, even though
+    # the tool itself succeeded. This is invisible to tests that call the
+    # wrapped function directly in Python, since that path never touches the
+    # SDK's schema/signature machinery at all.
+    #
+    # Setting `__signature__` explicitly makes `wrapper` self-describing
+    # again: `inspect.signature` stops unwrapping as soon as it finds an
+    # object that already carries `__signature__`, so it uses this signature
+    # instead of following `__wrapped__` to `fn`. Parameters are copied
+    # unchanged from `fn` (via `eval_str=True`, to resolve the string
+    # annotations `from __future__ import annotations` produces) since later
+    # tools take real arguments (metric name, date range, ...) that must
+    # still appear in the input schema — only the return annotation changes.
+    original_signature = inspect.signature(fn, eval_str=True)
+    wrapper.__signature__ = original_signature.replace(return_annotation=dict[str, Any])
+    wrapper.__annotations__ = {
+        **getattr(fn, "__annotations__", {}),
+        "return": dict[str, Any],
+    }
 
     return wrapper
 
