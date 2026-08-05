@@ -19,6 +19,7 @@
 - **Config comes only from environment variables.** No client ID, secret, or project ID may be hardcoded in any source file.
 - **API base:** `https://health.googleapis.com/v4`
 - **Query range limits (API-imposed):** 14 days for `heart-rate`, `active-minutes`, `total-calories`, `calories-in-heart-rate-zone`; 90 days for all other data types.
+- **Tools are validated against an output schema derived from their return annotation.** `tool_guard` must reset the wrapper's `__annotations__["return"]` to `dict[str, Any]` after `functools.wraps`, or the SDK validates the returned dict against a `ToolResult` schema and every call fails. Unit tests that call a tool function directly do NOT exercise this — a test must go through `mcp.call_tool(...)`.
 - **Never emit to stdout** anywhere in the server process — stdout is the MCP protocol stream. All diagnostics go to stderr via `logging`.
 
 ---
@@ -2652,6 +2653,17 @@ def tool_guard(fn: Callable[..., ToolResult]) -> Callable[..., dict[str, Any]]:
             logger.exception("Unexpected error in %s", fn.__name__)
             return ToolResult.error(f"Unexpected error in {fn.__name__}: {exc}").to_dict()
 
+    # functools.wraps copies __annotations__ from `fn`, whose return annotation
+    # is ToolResult — which would clobber the wrapper's own `-> dict`. The MCP
+    # SDK builds each tool's OUTPUT SCHEMA from that annotation and validates
+    # the returned value against it, so leaving it as ToolResult makes every
+    # tool call fail validation: to_dict() flattens `meta` into the top level,
+    # while a ToolResult schema requires a `meta` object. Restore the real
+    # return type so the SDK sees what the wrapper actually returns.
+    wrapper.__annotations__ = {
+        **getattr(fn, "__annotations__", {}),
+        "return": dict[str, Any],
+    }
     return wrapper
 
 
