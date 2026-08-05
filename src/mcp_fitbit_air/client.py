@@ -26,6 +26,11 @@ MAX_RETRIES = 3
 BACKOFF_BASE_SECONDS = 1.0
 TIMEOUT_SECONDS = 30
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+# Cap on pages followed via `nextPageToken`. Without this, a server that keeps
+# returning a non-empty token (or repeats the same one) would spin the loop
+# forever — and since this client is the single seam every tool call goes
+# through, that hangs the whole MCP server. Truncated data beats a hung server.
+MAX_PAGES = 50
 
 AUTH_REMEDY = "Run `mcp-fitbit-air auth` to re-authenticate."
 
@@ -114,6 +119,66 @@ class HealthClient:
                 return str(error)
         return str(payload)[:200]
 
+    def _paginate(
+        self,
+        method: str,
+        url: str,
+        items_key: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Follow `nextPageToken` to completion, guarding against the two ways
+        a pagination loop can hang forever: a server that repeats the same
+        token (cycle) and a server that keeps minting fresh tokens
+        indefinitely (unbounded growth). Since this helper is the single seam
+        every paginated tool call goes through, either failure mode would
+        otherwise hang the whole MCP server.
+
+        Exactly one of `params` (GET query params) / `json_body` (POST body)
+        should be provided, matching `method`. The token is threaded back
+        into whichever one was given, under the key `pageToken`.
+        """
+        collected: list[dict[str, Any]] = []
+        token: str | None = None
+
+        for page in range(MAX_PAGES):
+            request_kwargs: dict[str, Any] = {}
+            if params is not None:
+                request_kwargs["params"] = params
+            if json_body is not None:
+                request_kwargs["json"] = json_body
+
+            payload = self._request(method, url, **request_kwargs)
+            collected.extend(payload.get(items_key, []))
+
+            next_token = payload.get("nextPageToken")
+            if not next_token:
+                return collected
+            if next_token == token:
+                logger.warning(
+                    "Pagination cycle detected for %s (repeated nextPageToken); "
+                    "stopping after %d page(s) with %d item(s) collected.",
+                    url,
+                    page + 1,
+                    len(collected),
+                )
+                return collected
+
+            token = next_token
+            if params is not None:
+                params = dict(params, pageToken=token)
+            if json_body is not None:
+                json_body = dict(json_body, pageToken=token)
+
+        logger.warning(
+            "Hit MAX_PAGES=%d while paginating %s; returning %d item(s) "
+            "collected so far (data may be truncated).",
+            MAX_PAGES,
+            url,
+            len(collected),
+        )
+        return collected
+
     # -- public API --------------------------------------------------------
 
     def get_profile(self) -> dict[str, Any]:
@@ -139,14 +204,7 @@ class HealthClient:
         if filter_expr:
             params["filter"] = filter_expr
 
-        collected: list[dict[str, Any]] = []
-        while True:
-            payload = self._request("GET", url, params=params)
-            collected.extend(payload.get("dataPoints", []))
-            token = payload.get("nextPageToken")
-            if not token:
-                return collected
-            params = dict(params, pageToken=token)
+        return self._paginate("GET", url, "dataPoints", params=params)
 
     def daily_rollup(
         self,
@@ -172,11 +230,4 @@ class HealthClient:
             "windowSizeDays": window_size_days,
         }
 
-        collected: list[dict[str, Any]] = []
-        while True:
-            payload = self._request("POST", url, json=body)
-            collected.extend(payload.get("rollupDataPoints", []))
-            token = payload.get("nextPageToken")
-            if not token:
-                return collected
-            body = dict(body, pageToken=token)
+        return self._paginate("POST", url, "rollupDataPoints", json_body=body)

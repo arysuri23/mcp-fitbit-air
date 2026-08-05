@@ -5,7 +5,7 @@ import pytest
 import requests
 import responses
 
-from mcp_fitbit_air.client import ApiError, HealthClient, RateLimitError
+from mcp_fitbit_air.client import MAX_PAGES, ApiError, HealthClient, RateLimitError
 
 BASE = "https://health.googleapis.com/v4"
 
@@ -401,3 +401,99 @@ def test_daily_rollup_follows_pagination(client):
     assert len(responses.calls) == 2
     second_body = json.loads(responses.calls[1].request.body.decode())
     assert second_body["pageToken"] == "page2"
+
+
+# -- Pagination hang guards: repeated (cyclic) token and unbounded fresh
+# tokens must both terminate rather than looping forever. This client is the
+# single seam every tool call goes through, so an unbounded pagination loop
+# hangs the whole MCP server. --
+
+
+@responses.activate
+def test_list_data_points_stops_on_repeated_page_token(client):
+    """A server that returns the same nextPageToken twice is a server bug;
+    the client must stop rather than loop forever, and must still hand back
+    whatever it collected."""
+    responses.add(
+        responses.GET,
+        f"{BASE}/users/me/dataTypes/sleep/dataPoints",
+        json={"dataPoints": [{"id": 1}], "nextPageToken": "cycle"},
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        f"{BASE}/users/me/dataTypes/sleep/dataPoints",
+        json={"dataPoints": [{"id": 2}], "nextPageToken": "cycle"},
+        status=200,
+    )
+
+    points = client.list_data_points("sleep")
+
+    assert [p["id"] for p in points] == [1, 2]
+    # Exactly 2 calls: the cycle is detected right after the second response
+    # repeats the token used to fetch it, so a third (identical) request is
+    # never issued.
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_list_data_points_stops_at_max_pages(client):
+    """A server that keeps minting fresh, non-empty tokens forever must not
+    hang the client indefinitely; it should stop at MAX_PAGES and return the
+    partial data rather than raising."""
+    for i in range(MAX_PAGES):
+        responses.add(
+            responses.GET,
+            f"{BASE}/users/me/dataTypes/sleep/dataPoints",
+            json={"dataPoints": [{"id": i}], "nextPageToken": f"token{i}"},
+            status=200,
+        )
+
+    points = client.list_data_points("sleep")
+
+    assert len(responses.calls) == MAX_PAGES
+    assert [p["id"] for p in points] == list(range(MAX_PAGES))
+
+
+@responses.activate
+def test_daily_rollup_stops_on_repeated_page_token(client):
+    """Same cycle guard as `list_data_points`, but for the POST-based
+    `daily_rollup` pagination loop."""
+    responses.add(
+        responses.POST,
+        f"{BASE}/users/me/dataTypes/steps/dataPoints:dailyRollUp",
+        json={"rollupDataPoints": [{"steps": {"count": 100}}], "nextPageToken": "cycle"},
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        f"{BASE}/users/me/dataTypes/steps/dataPoints:dailyRollUp",
+        json={"rollupDataPoints": [{"steps": {"count": 200}}], "nextPageToken": "cycle"},
+        status=200,
+    )
+
+    points = client.daily_rollup("steps", date(2026, 8, 1), date(2026, 8, 2))
+
+    assert [p["steps"]["count"] for p in points] == [100, 200]
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_daily_rollup_stops_at_max_pages(client):
+    """Same page-cap guard as `list_data_points`, but for the POST-based
+    `daily_rollup` pagination loop."""
+    for i in range(MAX_PAGES):
+        responses.add(
+            responses.POST,
+            f"{BASE}/users/me/dataTypes/steps/dataPoints:dailyRollUp",
+            json={
+                "rollupDataPoints": [{"steps": {"count": i}}],
+                "nextPageToken": f"token{i}",
+            },
+            status=200,
+        )
+
+    points = client.daily_rollup("steps", date(2026, 8, 1), date(2026, 8, 2))
+
+    assert len(responses.calls) == MAX_PAGES
+    assert [p["steps"]["count"] for p in points] == list(range(MAX_PAGES))
