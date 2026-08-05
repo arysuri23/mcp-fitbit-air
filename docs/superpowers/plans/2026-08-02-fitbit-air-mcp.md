@@ -2220,6 +2220,12 @@ MAX_RETRIES = 3
 BACKOFF_BASE_SECONDS = 1.0
 TIMEOUT_SECONDS = 30
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+# Cap on pages followed via `nextPageToken`. Without it, a server that keeps
+# returning a non-empty token — or repeats the same one — spins the loop
+# forever, and since this client is the single seam every tool call goes
+# through, that hangs the whole MCP server. Truncated data beats a hung server,
+# so hitting the cap logs a warning and returns what was collected.
+MAX_PAGES = 50
 
 AUTH_REMEDY = "Run `mcp-fitbit-air auth` to re-authenticate."
 
