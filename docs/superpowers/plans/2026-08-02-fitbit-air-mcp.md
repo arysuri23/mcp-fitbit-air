@@ -2823,6 +2823,7 @@ not mistaken for a settled 30-day one.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 BASELINE_WINDOW_DAYS = 30
@@ -2841,7 +2842,11 @@ class Baseline:
 def compute_baseline(
     values: list[float | None], window_days: int = BASELINE_WINDOW_DAYS
 ) -> Baseline:
-    present = [v for v in values if v is not None]
+    # Non-finite values are excluded alongside None. Upstream coerce_number
+    # already rejects them, but a single NaN reaching here would make the whole
+    # mean NaN — and baselines ride along in every summary row that goes onto
+    # the MCP stdio stream, where bare NaN is invalid JSON.
+    present = [v for v in values if v is not None and math.isfinite(v)]
     if not present:
         return Baseline(mean=None, n=0, window_days=window_days)
     return Baseline(
