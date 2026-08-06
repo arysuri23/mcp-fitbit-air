@@ -1,8 +1,10 @@
+import logging
 import math
 from datetime import date
 
 import pytest
 
+from mcp_fitbit_air import mapping as mapping_module
 from mcp_fitbit_air.mapping import (
     METRICS,
     SUMMARY_METRICS,
@@ -377,6 +379,72 @@ def test_active_zone_minutes_extracts_both_rollup_and_list_shapes():
     assert metric.date_of(fat_burn_point) == date(2026, 8, 2)
     assert metric.extract(cardio_point) == 6.0  # 3 minutes * weight 2
     assert metric.extract(peak_point) == 4.0  # 2 minutes * weight 2
+
+
+def test_active_zone_minutes_list_warns_once_for_an_unrecognised_zone(caplog):
+    """An unknown heartRateZone label must not be misweighted or crash the
+    process — it must be excluded from the total, loudly. Skipping without
+    a trace would be exactly the silent-failure bug this module exists to
+    close."""
+    mapping_module._AZM_WARNED_ZONES.clear()
+    point = {
+        "activeZoneMinutes": {
+            "interval": {"civilStartTime": {"date": {"year": 2026, "month": 8, "day": 2}}},
+            "heartRateZone": "CARDIO_ZONE",  # not one of the labels we weight
+            "activeZoneMinutes": "5",
+        }
+    }
+    with caplog.at_level(logging.WARNING, logger="mcp_fitbit_air.mapping"):
+        value = get_metric("active_zone_minutes").extract(point)
+
+    assert value is None
+    assert "CARDIO_ZONE" in caplog.text
+
+
+def test_active_zone_minutes_list_known_zones_emit_no_warning(caplog):
+    mapping_module._AZM_WARNED_ZONES.clear()
+    metric = get_metric("active_zone_minutes")
+    point = {
+        "activeZoneMinutes": {
+            "interval": {"civilStartTime": {"date": {"year": 2026, "month": 8, "day": 2}}},
+            "heartRateZone": "FAT_BURN",
+            "activeZoneMinutes": "1",
+        }
+    }
+    with caplog.at_level(logging.WARNING, logger="mcp_fitbit_air.mapping"):
+        value = metric.extract(point)
+
+    assert value == 1.0
+    assert caplog.records == []
+
+
+def test_active_zone_minutes_mix_of_known_and_unknown_zones_warns_once_not_per_point(
+    caplog,
+):
+    """Intraday AZM responses can carry hundreds of per-minute records. The
+    same unrecognised label recurring across many points must warn once,
+    not flood stderr once per point, while still excluding every one of
+    those points from the total and counting the known-zone points
+    correctly."""
+    mapping_module._AZM_WARNED_ZONES.clear()
+    metric = get_metric("active_zone_minutes")
+    fat_point = {
+        "activeZoneMinutes": {"heartRateZone": "FAT_BURN", "activeZoneMinutes": "1"}
+    }
+    unknown_point = {
+        "activeZoneMinutes": {"heartRateZone": "OUT_OF_RANGE", "activeZoneMinutes": "9"}
+    }
+
+    with caplog.at_level(logging.WARNING, logger="mcp_fitbit_air.mapping"):
+        fat_value = metric.extract(fat_point)
+        unknown_value_1 = metric.extract(unknown_point)
+        unknown_value_2 = metric.extract(unknown_point)
+
+    assert fat_value == 1.0
+    assert unknown_value_1 is None
+    assert unknown_value_2 is None
+    matching = [r for r in caplog.records if "OUT_OF_RANGE" in r.getMessage()]
+    assert len(matching) == 1, "expected exactly one warning for the repeated label"
 
 
 def test_rollup_shaped_point_resolves_a_date_for_every_dailyrollup_metric():

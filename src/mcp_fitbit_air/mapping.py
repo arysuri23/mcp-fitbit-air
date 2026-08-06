@@ -19,11 +19,17 @@ Three things about this API make a naive mapping wrong:
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
+
+# stdout carries the MCP protocol stream; a stray print() there would corrupt
+# the session. Logging is safe: getLogger() with no handler attached here
+# just propagates to the root logger, which the server configures to stderr.
+logger = logging.getLogger(__name__)
 
 
 class UnknownMetricError(Exception):
@@ -175,6 +181,32 @@ def _active_zone_minutes(point: dict) -> float | None:
 # rollup sums, so a summed series matches the rollup's headline number.
 _AZM_ZONE_WEIGHT = {"FAT_BURN": 1.0, "CARDIO": 2.0, "PEAK": 2.0}
 
+# Labels we've already warned about. Intraday AZM responses can carry
+# hundreds of per-minute records; without this, a session with one
+# unanticipated zone label would emit hundreds of identical warnings for
+# zero extra information. Keyed by repr() so a non-string (or unhashable)
+# label can never raise from the cache lookup itself.
+_AZM_WARNED_ZONES: set[str] = set()
+
+
+def _warn_unrecognised_azm_zone(zone: Any) -> None:
+    """Skipping an unrecognised zone is the right call — misweighting it
+    would corrupt the total, and guessing is worse than a gap. But a silent
+    skip is exactly the failure mode this whole fix exists to close, so log
+    it once per unique label (not once per data point) with the label
+    verbatim, so it's actionable without re-deriving the problem."""
+    key = repr(zone)
+    if key in _AZM_WARNED_ZONES:
+        return
+    _AZM_WARNED_ZONES.add(key)
+    logger.warning(
+        "active_zone_minutes: unrecognised heartRateZone label %r in a "
+        "list-shape data point; its minutes are excluded from the total "
+        "rather than misweighted. Known labels: %s.",
+        zone,
+        sorted(_AZM_ZONE_WEIGHT),
+    )
+
 
 def _active_zone_minutes_list(point: dict) -> float | None:
     """list shape: a single per-minute record with a zone label, e.g.
@@ -187,8 +219,10 @@ def _active_zone_minutes_list(point: dict) -> float | None:
     minutes = coerce_number(payload.get("activeZoneMinutes"))
     if minutes is None:
         return None
-    weight = _AZM_ZONE_WEIGHT.get(payload.get("heartRateZone"))
+    zone = payload.get("heartRateZone")
+    weight = _AZM_ZONE_WEIGHT.get(zone)
     if weight is None:
+        _warn_unrecognised_azm_zone(zone)
         return None
     return minutes * weight
 
