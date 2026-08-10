@@ -3379,7 +3379,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from zoneinfo import ZoneInfo
 
-from .baselines import compute_baseline
+from .baselines import BASELINE_WINDOW_DAYS, compute_baseline
 from .fetch import MetricSeries, fetch_metric
 from .mapping import get_metric
 from .results import ResultState
@@ -3387,15 +3387,37 @@ from .results import ResultState
 logger = logging.getLogger(__name__)
 
 MAX_SUMMARY_DAYS = 90
+BASELINE_LOOKBACK_DAYS = BASELINE_WINDOW_DAYS
 
 
 def _days_in(start: date, end: date) -> list[date]:
     return [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
 
 
+def _fetch_start(start: date, end: date, metric_names: list[str]) -> date:
+    """How far back to reach for baseline history.
+
+    Every metric has its own per-request range cap, and the whole set is fetched
+    over one shared window, so the budget is the narrowest cap in the set. What
+    is left after the requested range is what the lookback may use.
+    """
+    span = (end - start).days + 1
+    budget = min(
+        (get_metric(name).max_range_days for name in metric_names),
+        default=MAX_SUMMARY_DAYS,
+    )
+    lookback = max(0, min(BASELINE_LOOKBACK_DAYS, budget - span))
+    return start - timedelta(days=lookback)
+
+
 def build_summary(
     client, start: date, end: date, metric_names: list[str], tz: ZoneInfo
 ) -> dict:
+    if end < start:
+        raise ValueError(
+            f"End date {end.isoformat()} is before start date {start.isoformat()}."
+        )
+
     span = (end - start).days + 1
     if span > MAX_SUMMARY_DAYS:
         raise ValueError(
@@ -3404,14 +3426,22 @@ def build_summary(
             "single metric."
         )
 
+    fetch_start = _fetch_start(start, end, metric_names)
+    window_days = (end - fetch_start).days + 1
+
     with ThreadPoolExecutor(max_workers=len(metric_names) or 1) as pool:
         series_list: list[MetricSeries] = list(
-            pool.map(lambda name: fetch_metric(client, name, start, end, tz), metric_names)
+            pool.map(
+                lambda name: fetch_metric(client, name, fetch_start, end, tz),
+                metric_names,
+            )
         )
     series_by_name = {s.metric.name: s for s in series_list}
 
+    # Computed over the widened window, including the lookback days that are
+    # never emitted as rows.
     baselines = {
-        name: compute_baseline(list(s.by_day.values()))
+        name: compute_baseline(list(s.by_day.values()), window_days=window_days)
         for name, s in series_by_name.items()
     }
 
@@ -3455,6 +3485,11 @@ def build_summary(
 
     return {
         "range": {"start": start.isoformat(), "end": end.isoformat()},
+        "baseline_window": {
+            "start": fetch_start.isoformat(),
+            "end": end.isoformat(),
+            "days": window_days,
+        },
         "days": days,
         "metric_status": metric_status,
     }
@@ -3486,7 +3521,8 @@ def get_daily_summary(start_date: str, end_date: str | None = None) -> ToolResul
     "2026-07-28". Give a whole-range expression as start_date on its own
     ("last week"), or a start and end pair. Maximum range is 90 days.
 
-    Every value carries its unit and a trailing 30-day baseline with the sample
+    Every value carries its unit and a trailing baseline computed over a window
+    reaching up to 30 days before the requested range, reported alongside the sample
     size it was computed from — a baseline with a small n should not be read as
     a settled norm. Days with no data are marked no_data rather than zero, and
     metrics Fitbit has not computed yet are marked warming_up.

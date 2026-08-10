@@ -18,9 +18,10 @@ from .auth import AuthError
 from .client import ApiError
 from .config import ConfigError
 from .context import get_context
-from .dates import DateParseError
-from .mapping import UnknownMetricError
+from .dates import DateParseError, resolve_range
+from .mapping import SUMMARY_METRICS, UnknownMetricError
 from .results import ToolResult
+from .summary import build_summary
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,47 @@ def get_profile_and_devices() -> ToolResult:
         )
 
     return ToolResult.ok({"profile": profile, "settings": settings, "devices": devices})
+
+
+@mcp.tool()
+@tool_guard
+def get_daily_summary(start_date: str, end_date: str | None = None) -> ToolResult:
+    """Get a day-by-day health summary: sleep, resting heart rate, HRV, steps,
+    active zone minutes, SpO2, and skin temperature deviation.
+
+    This is the tool to reach for first — most questions about recent health
+    can be answered from a single call.
+
+    Dates accept natural language: "last week", "yesterday", "last 30 days",
+    "2026-07-28". Give a whole-range expression as start_date on its own
+    ("last week"), or a start and end pair. Maximum range is 90 days.
+
+    Every value carries its unit and a trailing baseline computed over a window
+    reaching up to 30 days before the requested range, reported alongside the
+    sample size it came from — a baseline with a small n is not a settled norm.
+    Days with no data are marked no_data rather than zero, and metrics Fitbit
+    has not computed yet are marked warming_up.
+    """
+    ctx = get_context()
+    start, end = resolve_range(start_date, end_date, ctx.timezone)
+    try:
+        summary = build_summary(ctx.client, start, end, SUMMARY_METRICS, ctx.timezone)
+    except ValueError as exc:
+        return ToolResult.error(str(exc))
+
+    has_any = any(
+        cell.get("state") == "ok"
+        for day in summary["days"]
+        for cell in day["metrics"].values()
+    )
+    if not has_any:
+        return ToolResult.no_data(
+            f"No health data recorded between {start.isoformat()} and {end.isoformat()}. "
+            "Check that the Fitbit Air has synced recently with get_profile_and_devices.",
+            **summary,
+        )
+
+    return ToolResult.ok(summary)
 
 
 def run_server() -> None:
