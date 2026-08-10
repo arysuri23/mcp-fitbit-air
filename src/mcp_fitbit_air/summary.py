@@ -21,9 +21,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from zoneinfo import ZoneInfo
 
-from .baselines import BASELINE_WINDOW_DAYS, compute_baseline
+from .baselines import BASELINE_WINDOW_DAYS, compute_baseline, lookback_start
 from .fetch import MetricSeries, fetch_metric
-from .mapping import get_metric
 from .results import ResultState
 
 logger = logging.getLogger(__name__)
@@ -34,22 +33,6 @@ BASELINE_LOOKBACK_DAYS = BASELINE_WINDOW_DAYS
 
 def _days_in(start: date, end: date) -> list[date]:
     return [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
-
-
-def _fetch_start(start: date, end: date, metric_names: list[str]) -> date:
-    """How far back to reach for baseline history.
-
-    Every metric has its own per-request range cap, and the whole set is fetched
-    over one shared window, so the budget is the narrowest cap in the set. What
-    is left after the requested range is what the lookback may use.
-    """
-    span = (end - start).days + 1
-    budget = min(
-        (get_metric(name).max_range_days for name in metric_names),
-        default=MAX_SUMMARY_DAYS,
-    )
-    lookback = max(0, min(BASELINE_LOOKBACK_DAYS, budget - span))
-    return start - timedelta(days=lookback)
 
 
 def build_summary(
@@ -68,7 +51,7 @@ def build_summary(
             "single metric."
         )
 
-    fetch_start = _fetch_start(start, end, metric_names)
+    fetch_start = lookback_start(start, end, metric_names)
     window_days = (end - fetch_start).days + 1
 
     with ThreadPoolExecutor(max_workers=len(metric_names) or 1) as pool:

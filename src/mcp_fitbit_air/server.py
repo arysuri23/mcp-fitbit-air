@@ -6,21 +6,25 @@ Diagnostics go to stderr via logging.
 
 from __future__ import annotations
 
+import datetime as dt
 import functools
 import inspect
 import logging
 import sys
+from datetime import timedelta
 from typing import Any, Callable
 
 from mcp.server.mcpserver import MCPServer
 
 from .auth import AuthError
+from .baselines import compute_baseline, lookback_start
 from .client import ApiError
 from .config import ConfigError
 from .context import get_context
 from .dates import DateParseError, resolve_range
-from .mapping import SUMMARY_METRICS, UnknownMetricError
-from .results import ToolResult
+from .fetch import build_filter, fetch_metric
+from .mapping import METRICS, SUMMARY_METRICS, UnknownMetricError, get_metric
+from .results import ResultState, ToolResult
 from .summary import build_summary
 
 logger = logging.getLogger(__name__)
@@ -157,6 +161,168 @@ def get_daily_summary(start_date: str, end_date: str | None = None) -> ToolResul
         )
 
     return ToolResult.ok(summary)
+
+
+MAX_INTRADAY_DAYS = 7
+
+
+def _reading_time(point: dict) -> str | None:
+    """Best-effort physical timestamp for one intraday reading.
+
+    The two intraday metrics do not share a shape: heart_rate carries
+    `heartRate.sampleTime.physicalTime`, while steps carries
+    `steps.interval.startTime`. Both are checked, and the bare point last, so a
+    future type that hoists either field still resolves.
+    """
+    for holder in (point.get("heartRate") or {}, point.get("steps") or {}, point):
+        if not isinstance(holder, dict):
+            continue
+        sample = holder.get("sampleTime")
+        if isinstance(sample, dict) and isinstance(sample.get("physicalTime"), str):
+            return sample["physicalTime"]
+        interval = holder.get("interval")
+        if isinstance(interval, dict) and isinstance(interval.get("startTime"), str):
+            return interval["startTime"]
+    return None
+
+
+def _intraday_series(ctx, metric, start: dt.date, end: dt.date, truncated: bool) -> ToolResult:
+    # build_filter owns the per-type dialect choice; the wrong one returns
+    # HTTP 200 with zero points rather than an error.
+    points = ctx.client.list_data_points(
+        metric.data_type,
+        filter_expr=build_filter(metric, start, end, ctx.timezone),
+    )
+
+    readings = []
+    for point in points:
+        value = metric.extract(point)
+        if value is None:
+            continue
+        readings.append({"time": _reading_time(point), "value": value})
+
+    # The API makes no ordering promise, and an out-of-order series reads as
+    # noise. Readings with no resolvable time sort last rather than first.
+    readings.sort(key=lambda r: (r["time"] is None, r["time"] or ""))
+
+    meta = {}
+    if truncated:
+        meta = {
+            "truncated": True,
+            "reason": (
+                f"Intraday requests are capped at {MAX_INTRADAY_DAYS} days to keep "
+                "responses manageable; only the most recent window was returned."
+            ),
+        }
+
+    if not readings:
+        return ToolResult.no_data(
+            f"No intraday {metric.name} recorded between {start.isoformat()} and "
+            f"{end.isoformat()}.",
+            **meta,
+        )
+
+    return ToolResult.ok(
+        {
+            "metric": metric.name,
+            "unit": metric.unit,
+            "granularity": "intraday",
+            "range": {"start": start.isoformat(), "end": end.isoformat()},
+            "readings": readings,
+        },
+        **meta,
+    )
+
+
+@mcp.tool()
+@tool_guard
+def get_metric_series(
+    metric: str,
+    start_date: str,
+    end_date: str | None = None,
+    granularity: str = "daily",
+) -> ToolResult:
+    """Get one metric over time, for drilling into a trend.
+
+    Valid metrics: sleep_duration, resting_heart_rate, hrv, steps,
+    active_zone_minutes, spo2, skin_temperature_deviation, heart_rate.
+
+    granularity is "daily" (default) or "intraday". Intraday gives
+    minute-level readings and is supported only for heart_rate and steps; it is
+    capped at 7 days regardless of the range requested, and the response says
+    so when it truncates.
+
+    Dates accept natural language, as in get_daily_summary. Daily results carry
+    a trailing baseline drawn from up to 30 days before the requested range,
+    reported with the sample size and the window it actually used.
+    """
+    # Checked before get_context() so a typo fails on its own terms rather than
+    # as an authentication error.
+    if granularity not in {"daily", "intraday"}:
+        return ToolResult.error(
+            f"Unknown granularity {granularity!r}. Use \"daily\" or \"intraday\"."
+        )
+
+    spec = get_metric(metric)  # raises UnknownMetricError, handled by tool_guard
+    ctx = get_context()
+    start, end = resolve_range(start_date, end_date, ctx.timezone)
+
+    if granularity == "intraday":
+        if not spec.supports_intraday:
+            supported = sorted(n for n, m in METRICS.items() if m.supports_intraday)
+            return ToolResult.error(
+                f"{metric} does not support intraday granularity. Intraday is "
+                f"available for: {', '.join(supported)}."
+            )
+        truncated = (end - start).days + 1 > MAX_INTRADAY_DAYS
+        if truncated:
+            start = end - timedelta(days=MAX_INTRADAY_DAYS - 1)
+        return _intraday_series(ctx, spec, start, end, truncated)
+
+    span = (end - start).days + 1
+    if span > spec.max_range_days:
+        return ToolResult.error(
+            f"Range of {span} days exceeds the {spec.max_range_days}-day maximum "
+            f"for {metric}. Request a narrower range."
+        )
+
+    # Reach back past `start` so the baseline is trailing rather than a mean of
+    # the same days being asked about. Those extra days inform the baseline and
+    # are then dropped from `points`.
+    fetch_start = lookback_start(start, end, [metric])
+    series = fetch_metric(ctx.client, metric, fetch_start, end, ctx.timezone)
+
+    if series.state is ResultState.ERROR:
+        return ToolResult.error(series.message or "Failed to fetch metric.")
+    if series.state is ResultState.WARMING_UP:
+        return ToolResult.warming_up(series.message, warmup_nights=spec.warmup_nights)
+    if series.state is ResultState.NO_DATA:
+        return ToolResult.no_data(series.message)
+
+    baseline = compute_baseline(
+        list(series.by_day.values()), window_days=(end - fetch_start).days + 1
+    )
+    points = [
+        {"date": day.isoformat(), "value": value}
+        for day, value in sorted(series.by_day.items())
+        if start <= day <= end
+    ]
+
+    return ToolResult.ok(
+        {
+            "metric": metric,
+            "unit": spec.unit,
+            "granularity": "daily",
+            "range": {"start": start.isoformat(), "end": end.isoformat()},
+            "baseline_window": {
+                "start": fetch_start.isoformat(),
+                "end": end.isoformat(),
+                "days": (end - fetch_start).days + 1,
+            },
+            "baseline": baseline.to_dict(),
+            "points": points,
+        }
+    )
 
 
 def run_server() -> None:

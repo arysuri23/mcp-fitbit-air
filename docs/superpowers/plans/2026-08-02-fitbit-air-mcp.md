@@ -3648,8 +3648,16 @@ def test_intraday_on_unsupported_metric_is_an_error(fake_context):
 def test_intraday_range_is_truncated_to_seven_days(fake_context):
     from mcp_fitbit_air import server
 
+    # Real shape, from tests/fixtures/list_heart_rate_nofilter.json. An invented
+    # shape (e.g. heartRate.bpm) extracts nothing, so every reading assertion
+    # would pass vacuously against zero readings.
     fake_context.client.list_data_points.return_value = [
-        {"heartRate": {"bpm": 62}, "interval": {"startTime": "2026-08-01T09:00:00Z"}}
+        {
+            "heartRate": {
+                "beatsPerMinute": "62",
+                "sampleTime": {"physicalTime": "2026-08-01T09:00:00Z"},
+            }
+        }
     ]
 
     result = server.get_metric_series(
@@ -3704,7 +3712,7 @@ Add to the existing imports in `src/mcp_fitbit_air/server.py`:
 import datetime as dt
 from datetime import timedelta
 
-from .baselines import compute_baseline
+from .baselines import compute_baseline, lookback_start
 from .fetch import build_filter, fetch_metric
 from .mapping import METRICS, get_metric
 from .results import ResultState
@@ -3748,6 +3756,10 @@ def _intraday_series(ctx, metric, start: dt.date, end: dt.date, truncated: bool)
         if value is None:
             continue
         readings.append({"time": _reading_time(point), "value": value})
+
+    # The API makes no ordering promise, and an out-of-order series reads as
+    # noise. Readings with no resolvable time sort last rather than first.
+    readings.sort(key=lambda r: (r["time"] is None, r["time"] or ""))
 
     meta = {}
     if truncated:
@@ -3797,15 +3809,18 @@ def get_metric_series(
     so when it truncates.
 
     Dates accept natural language, as in get_daily_summary. Daily results carry
-    a trailing 30-day baseline with its sample size.
+    a trailing baseline drawn from up to 30 days before the requested range,
+    reported with the sample size and the window it actually used.
     """
+    # Checked before get_context() so a typo fails on its own terms rather than
+    # as an authentication error.
     if granularity not in {"daily", "intraday"}:
         return ToolResult.error(
             f"Unknown granularity {granularity!r}. Use \"daily\" or \"intraday\"."
         )
 
-    ctx = get_context()
     spec = get_metric(metric)  # raises UnknownMetricError, handled by tool_guard
+    ctx = get_context()
     start, end = resolve_range(start_date, end_date, ctx.timezone)
 
     if granularity == "intraday":
@@ -3827,7 +3842,12 @@ def get_metric_series(
             f"for {metric}. Request a narrower range."
         )
 
-    series = fetch_metric(ctx.client, metric, start, end, ctx.timezone)
+    # Reach back past `start` so the baseline is trailing rather than a mean of
+    # the same days being asked about. Those extra days inform the baseline and
+    # are then dropped from `points`. lookback_start respects this metric's own
+    # max_range_days, so heart_rate gets 14 days rather than 30.
+    fetch_start = lookback_start(start, end, [metric])
+    series = fetch_metric(ctx.client, metric, fetch_start, end, ctx.timezone)
 
     if series.state is ResultState.ERROR:
         return ToolResult.error(series.message or "Failed to fetch metric.")
@@ -3836,10 +3856,13 @@ def get_metric_series(
     if series.state is ResultState.NO_DATA:
         return ToolResult.no_data(series.message)
 
-    baseline = compute_baseline(list(series.by_day.values()))
+    baseline = compute_baseline(
+        list(series.by_day.values()), window_days=(end - fetch_start).days + 1
+    )
     points = [
         {"date": day.isoformat(), "value": value}
         for day, value in sorted(series.by_day.items())
+        if start <= day <= end
     ]
 
     return ToolResult.ok(
@@ -3848,6 +3871,11 @@ def get_metric_series(
             "unit": spec.unit,
             "granularity": "daily",
             "range": {"start": start.isoformat(), "end": end.isoformat()},
+            "baseline_window": {
+                "start": fetch_start.isoformat(),
+                "end": end.isoformat(),
+                "days": (end - fetch_start).days + 1,
+            },
             "baseline": baseline.to_dict(),
             "points": points,
         }
