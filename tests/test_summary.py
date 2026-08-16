@@ -326,3 +326,23 @@ def test_call_tool_with_only_a_relative_start_date(fake_context):
     assert result.is_error is False
     payload = json.loads(result.content[0].text)
     assert payload["state"] in {"ok", "no_data"}
+
+
+def test_metric_status_reports_a_truncated_fetch(fake_context):
+    """A summary row that silently rests on a partially fetched series would let
+    Claude state a baseline as settled when it was computed from a hole."""
+    fake = {name: series(name, {}) for name in _all_summary_names()}
+    fake["steps"] = MetricSeries(
+        metric=get_metric("steps"),
+        by_day={date(2026, 8, 1): 9000},
+        truncated=True,
+        truncation_reason="Reached the 50-page fetch limit.",
+    )
+
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=fake_fetch(fake)):
+        result = build_summary(Mock(), date(2026, 8, 1), date(2026, 8, 1), _all_summary_names(), TZ)
+
+    assert result["metric_status"]["steps"]["truncated"] is True
+    assert "50-page" in result["metric_status"]["steps"]["reason"]
+    # A complete metric stays quiet rather than carrying truncated=False noise.
+    assert "truncated" not in result["metric_status"]["hrv"]

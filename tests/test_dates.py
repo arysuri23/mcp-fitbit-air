@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -46,8 +46,27 @@ def test_range_spanning_a_month_boundary():
     )
 
 
-def test_omitted_end_with_iso_start_runs_through_today():
+def test_omitted_end_means_that_single_day():
+    """A bare start is one day, not an open-ended range. Defaulting the end to
+    today made "yesterday" span two days and drag in today's partial data."""
     start, end = resolve_range("2026-07-28", None, TZ, TODAY)
+    assert (start, end) == (date(2026, 7, 28), date(2026, 7, 28))
+
+
+def test_yesterday_alone_resolves_to_exactly_yesterday():
+    start, end = resolve_range("yesterday", None, TZ, TODAY)
+    assert start == end == TODAY - timedelta(days=1)
+
+
+def test_a_day_word_and_its_iso_date_resolve_identically():
+    """The same day spelled two ways must not produce two different ranges."""
+    by_word = resolve_range("yesterday", None, TZ, TODAY)
+    by_iso = resolve_range((TODAY - timedelta(days=1)).isoformat(), None, TZ, TODAY)
+    assert by_word == by_iso
+
+
+def test_through_today_is_still_expressible_with_an_explicit_end():
+    start, end = resolve_range("2026-07-28", "today", TZ, TODAY)
     assert (start, end) == (date(2026, 7, 28), TODAY)
 
 

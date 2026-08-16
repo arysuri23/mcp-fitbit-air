@@ -1,4 +1,5 @@
 import asyncio
+import datetime as dt
 import json
 from datetime import date, timedelta
 from unittest.mock import Mock
@@ -291,7 +292,9 @@ def test_intraday_on_unsupported_metric_is_an_error(fake_context):
     assert "heart_rate" in result["message"]
 
 
-def test_intraday_returns_readings_with_times_and_values(fake_context):
+def test_intraday_aggregates_a_rate_into_min_max_avg_buckets(fake_context):
+    """Both readings fall in the same 5-minute bucket, so they collapse into one
+    entry. Summing a bpm would be meaningless, hence min/max/avg."""
     from mcp_fitbit_air import server
 
     fake_context.client.list_data_points.return_value = [
@@ -305,10 +308,117 @@ def test_intraday_returns_readings_with_times_and_values(fake_context):
 
     assert result["state"] == "ok"
     assert result["data"]["granularity"] == "intraday"
+    assert result["data"]["aggregation"] == "min/max/avg"
     assert result["data"]["readings"] == [
-        {"time": "2026-08-01T09:00:00Z", "value": 62.0},
-        {"time": "2026-08-01T09:01:00Z", "value": 71.0},
+        {"time": "2026-08-01T09:00:00Z", "min": 62.0, "max": 71.0, "avg": 66.5, "n": 2}
     ]
+
+
+def test_intraday_aggregation_collapses_a_realistic_sample_rate(fake_context):
+    """The defect this replaced: the band samples every ~2 seconds, so one live
+    day returned 38,093 raw readings (1.87 MB of JSON). Bucketing must reduce
+    that by orders of magnitude, not merely relabel it."""
+    from mcp_fitbit_air import server
+
+    # 20 minutes of 2-second sampling.
+    base = dt.datetime(2026, 8, 1, 9, 0, tzinfo=dt.timezone.utc)
+    fake_context.client.list_data_points.return_value = [
+        hr_point("60", (base + dt.timedelta(seconds=2 * i)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        for i in range(600)
+    ]
+
+    result = server.get_metric_series(
+        "heart_rate", "2026-08-01", "2026-08-01", granularity="intraday"
+    )
+
+    readings = result["data"]["readings"]
+    assert len(readings) == 4  # 20 minutes / 5-minute buckets
+    assert sum(r["n"] for r in readings) == 600
+
+
+def test_intraday_bucket_count_stays_bounded_across_the_whole_cap(fake_context):
+    """Whatever range is asked for, the response must stay small enough to be
+    usable. Without an adaptive bucket, 7 days at 5 minutes is 2,016 entries."""
+    from mcp_fitbit_air import server
+
+    fake_context.client.list_data_points.return_value = [
+        hr_point("62", "2026-08-01T09:00:00Z")
+    ]
+
+    for start in ("2026-08-01", "2026-07-30", "2026-07-26"):
+        result = server.get_metric_series(
+            "heart_rate", start, "2026-08-01", granularity="intraday"
+        )
+        span_minutes = (
+            (date.fromisoformat("2026-08-01") - date.fromisoformat(start)).days + 1
+        ) * 24 * 60
+        assert span_minutes / result["data"]["bucket_minutes"] <= server.MAX_INTRADAY_BUCKETS
+
+
+def test_intraday_bucket_width_widens_with_the_range(fake_context):
+    from mcp_fitbit_air import server
+
+    fake_context.client.list_data_points.return_value = [
+        hr_point("62", "2026-08-01T09:00:00Z")
+    ]
+
+    one_day = server.get_metric_series(
+        "heart_rate", "2026-08-01", "2026-08-01", granularity="intraday"
+    )
+    seven_days = server.get_metric_series(
+        "heart_rate", "2026-07-26", "2026-08-01", granularity="intraday"
+    )
+
+    assert one_day["data"]["bucket_minutes"] == 5
+    assert seven_days["data"]["bucket_minutes"] > one_day["data"]["bucket_minutes"]
+
+
+def test_intraday_bucket_time_is_floored_to_the_boundary(fake_context):
+    """A bucket labelled with the first reading's time rather than the boundary
+    would make buckets look irregularly spaced."""
+    from mcp_fitbit_air import server
+
+    fake_context.client.list_data_points.return_value = [
+        hr_point("62", "2026-08-01T09:07:43Z")
+    ]
+
+    result = server.get_metric_series(
+        "heart_rate", "2026-08-01", "2026-08-01", granularity="intraday"
+    )
+
+    assert result["data"]["readings"][0]["time"] == "2026-08-01T09:05:00Z"
+
+
+def test_intraday_readings_with_no_resolvable_time_are_counted_not_dropped(fake_context):
+    """Silently dropping them would hide a shape change in the API behind data
+    that merely looks thinner."""
+    from mcp_fitbit_air import server
+
+    fake_context.client.list_data_points.return_value = [
+        hr_point("62", "2026-08-01T09:00:00Z"),
+        {"heartRate": {"beatsPerMinute": "70"}},  # no sampleTime at all
+    ]
+
+    result = server.get_metric_series(
+        "heart_rate", "2026-08-01", "2026-08-01", granularity="intraday"
+    )
+
+    assert result["data"]["unplaced_readings"] == 1
+    assert len(result["data"]["readings"]) == 1
+
+
+def test_intraday_omits_unplaced_count_when_everything_placed(fake_context):
+    from mcp_fitbit_air import server
+
+    fake_context.client.list_data_points.return_value = [
+        hr_point("62", "2026-08-01T09:00:00Z")
+    ]
+
+    result = server.get_metric_series(
+        "heart_rate", "2026-08-01", "2026-08-01", granularity="intraday"
+    )
+
+    assert "unplaced_readings" not in result["data"]
 
 
 def test_intraday_readings_are_sorted_by_time(fake_context):
@@ -346,7 +456,28 @@ def test_intraday_steps_read_their_time_from_the_interval(fake_context):
     )
 
     assert result["data"]["readings"] == [
-        {"time": "2026-08-01T09:00:00Z", "value": 120.0}
+        {"time": "2026-08-01T09:00:00Z", "total": 120.0, "n": 1}
+    ]
+
+
+def test_intraday_sums_an_additive_metric_within_a_bucket(fake_context):
+    """Steps are counts: two minutes of walking in one bucket is their sum, not
+    their average. Reporting avg here would understate activity threefold."""
+    from mcp_fitbit_air import server
+
+    fake_context.client.list_data_points.return_value = [
+        step_point("100", "2026-08-01T09:00:00Z"),
+        step_point("50", "2026-08-01T09:01:00Z"),
+        step_point("30", "2026-08-01T09:02:00Z"),
+    ]
+
+    result = server.get_metric_series(
+        "steps", "2026-08-01", "2026-08-01", granularity="intraday"
+    )
+
+    assert result["data"]["aggregation"] == "total"
+    assert result["data"]["readings"] == [
+        {"time": "2026-08-01T09:00:00Z", "total": 180.0, "n": 3}
     ]
 
 
@@ -459,6 +590,87 @@ def test_intraday_no_data_still_reports_truncation(fake_context):
     assert result["truncated"] is True
 
 
+# -- Page-cap truncation -----------------------------------------------------
+#
+# Verified live: two days of heart_rate returns 71,997 of ~76,186 points because
+# pagination stops at MAX_PAGES=50. Before this, the tool reported state="ok"
+# with no hint, and the only warning went to stderr where Claude cannot see it -
+# so an incomplete series would be analysed as though it were whole.
+
+
+def test_intraday_surfaces_page_cap_truncation(fake_context):
+    from mcp_fitbit_air import server
+    from mcp_fitbit_air.client import DataPoints
+
+    fake_context.client.list_data_points.return_value = DataPoints(
+        [hr_point("62", "2026-08-01T09:00:00Z")],
+        truncated=True,
+        truncation_reason="Reached the 50-page fetch limit with 72000 record(s).",
+    )
+
+    result = server.get_metric_series(
+        "heart_rate", "2026-08-01", "2026-08-01", granularity="intraday"
+    )
+
+    assert result["state"] == "ok"
+    assert result["truncated"] is True
+    assert "50-page" in result["reason"]
+
+
+def test_intraday_reports_both_truncation_causes_together(fake_context):
+    """A request can be cut twice over - once by the 7-day cap, once by the page
+    limit. Reporting only one would understate how partial the answer is."""
+    from mcp_fitbit_air import server
+    from mcp_fitbit_air.client import DataPoints
+
+    fake_context.client.list_data_points.return_value = DataPoints(
+        [hr_point("62", "2026-08-01T09:00:00Z")],
+        truncated=True,
+        truncation_reason="Reached the 50-page fetch limit.",
+    )
+
+    result = server.get_metric_series(
+        "heart_rate", "2026-07-01", "2026-08-01", granularity="intraday"
+    )
+
+    assert result["truncated"] is True
+    assert "7 days" in result["reason"]
+    assert "50-page" in result["reason"]
+
+
+def test_daily_surfaces_page_cap_truncation(fake_context, monkeypatch):
+    from mcp_fitbit_air import server
+
+    stub_fetch(
+        monkeypatch,
+        MetricSeries(
+            metric=get_metric("hrv"),
+            by_day={date(2026, 8, 1): 55.0},
+            truncated=True,
+            truncation_reason="Reached the 50-page fetch limit.",
+        ),
+    )
+
+    result = server.get_metric_series("hrv", "2026-08-01", "2026-08-01")
+
+    assert result["state"] == "ok"
+    assert result["truncated"] is True
+    assert "50-page" in result["reason"]
+
+
+def test_daily_stays_quiet_when_the_fetch_was_complete(fake_context, monkeypatch):
+    from mcp_fitbit_air import server
+
+    stub_fetch(
+        monkeypatch,
+        MetricSeries(metric=get_metric("hrv"), by_day={date(2026, 8, 1): 55.0}),
+    )
+
+    result = server.get_metric_series("hrv", "2026-08-01", "2026-08-01")
+
+    assert "truncated" not in result
+
+
 def test_intraday_result_is_json_serialisable_with_nan_rejected(fake_context):
     from mcp_fitbit_air import server
 
@@ -548,4 +760,5 @@ def test_call_tool_intraday_through_sdk_boundary(fake_context):
 
     assert result.is_error is False
     payload = json.loads(result.content[0].text)
-    assert payload["data"]["readings"][0]["value"] == 62.0
+    assert payload["data"]["readings"][0]["min"] == 62.0
+    assert payload["data"]["bucket_minutes"] == 5

@@ -104,7 +104,12 @@ def build_summary(
         days.append(row)
 
     metric_status = {
-        name: {"state": s.state.value, "message": s.message}
+        name: {
+            "state": s.state.value,
+            "message": s.message,
+            # Present only when it happened, so a clean row stays quiet.
+            **({"truncated": True, "reason": s.truncation_reason} if s.truncated else {}),
+        }
         for name, s in series_by_name.items()
     }
 

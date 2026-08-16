@@ -22,7 +22,7 @@ from .client import ApiError
 from .config import ConfigError
 from .context import get_context
 from .dates import DateParseError, resolve_range
-from .fetch import build_filter, fetch_metric
+from .fetch import ADDITIVE_UNITS, build_filter, fetch_metric
 from .mapping import METRICS, SUMMARY_METRICS, UnknownMetricError, get_metric
 from .results import ResultState, ToolResult
 from .summary import build_summary
@@ -186,6 +186,54 @@ def _reading_time(point: dict) -> str | None:
     return None
 
 
+# Intraday readings are aggregated into fixed time buckets rather than returned
+# raw. The band samples heart rate roughly every two seconds, not once a minute:
+# one real day measured 38,093 points, or 1.87 MB of JSON. Seven of those would
+# be ~13 MB on the stdio stream — useless to Claude and far past the page cap.
+# Buckets keep the shape of the day (when it rose, how high, for how long) at a
+# thousandth of the size.
+BUCKET_CHOICES_MINUTES = (5, 15, 30, 60, 120)
+MAX_INTRADAY_BUCKETS = 600
+
+
+def _bucket_minutes(start: dt.date, end: dt.date) -> int:
+    """Smallest bucket that keeps the response under MAX_INTRADAY_BUCKETS."""
+    total_minutes = ((end - start).days + 1) * 24 * 60
+    for size in BUCKET_CHOICES_MINUTES:
+        if total_minutes / size <= MAX_INTRADAY_BUCKETS:
+            return size
+    return BUCKET_CHOICES_MINUTES[-1]
+
+
+def _floor_to_bucket(moment: str, minutes: int) -> str | None:
+    """Floor an RFC-3339 instant onto a bucket boundary, or None if unparseable."""
+    try:
+        parsed = dt.datetime.fromisoformat(moment.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    epoch_minutes = int(parsed.timestamp() // 60)
+    floored = (epoch_minutes // minutes) * minutes
+    return dt.datetime.fromtimestamp(floored * 60, tz=dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def _summarise_bucket(time_label: str, values: list[float], additive: bool) -> dict:
+    """Additive metrics (steps, minutes) sum within a bucket; a rate like bpm
+    would be meaningless summed, so it reports its range and mean instead."""
+    if additive:
+        return {"time": time_label, "total": round(sum(values), 2), "n": len(values)}
+    return {
+        "time": time_label,
+        "min": min(values),
+        "max": max(values),
+        "avg": round(sum(values) / len(values), 1),
+        "n": len(values),
+    }
+
+
 def _intraday_series(ctx, metric, start: dt.date, end: dt.date, truncated: bool) -> ToolResult:
     # build_filter owns the per-type dialect choice; the wrong one returns
     # HTTP 200 with zero points rather than an error.
@@ -194,26 +242,40 @@ def _intraday_series(ctx, metric, start: dt.date, end: dt.date, truncated: bool)
         filter_expr=build_filter(metric, start, end, ctx.timezone),
     )
 
-    readings = []
+    bucket_minutes = _bucket_minutes(start, end)
+    additive = metric.unit in ADDITIVE_UNITS
+    buckets: dict[str, list[float]] = {}
+    unplaced = 0
+
     for point in points:
         value = metric.extract(point)
         if value is None:
             continue
-        readings.append({"time": _reading_time(point), "value": value})
+        label = _floor_to_bucket(_reading_time(point) or "", bucket_minutes)
+        if label is None:
+            # A reading with no resolvable timestamp cannot be placed in time.
+            # Counted rather than dropped silently, so a systematic shape change
+            # shows up as a number instead of as quietly missing data.
+            unplaced += 1
+            continue
+        buckets.setdefault(label, []).append(value)
 
-    # The API makes no ordering promise, and an out-of-order series reads as
-    # noise. Readings with no resolvable time sort last rather than first.
-    readings.sort(key=lambda r: (r["time"] is None, r["time"] or ""))
+    readings = [
+        _summarise_bucket(label, values, additive)
+        for label, values in sorted(buckets.items())
+    ]
 
-    meta = {}
+    meta: dict[str, Any] = {}
+    reasons = []
     if truncated:
-        meta = {
-            "truncated": True,
-            "reason": (
-                f"Intraday requests are capped at {MAX_INTRADAY_DAYS} days to keep "
-                "responses manageable; only the most recent window was returned."
-            ),
-        }
+        reasons.append(
+            f"Intraday requests are capped at {MAX_INTRADAY_DAYS} days to keep "
+            "responses manageable; only the most recent window was returned."
+        )
+    if getattr(points, "truncated", False):
+        reasons.append(points.truncation_reason or "The fetch stopped before the end of the range.")
+    if reasons:
+        meta = {"truncated": True, "reason": " ".join(reasons)}
 
     if not readings:
         return ToolResult.no_data(
@@ -222,16 +284,19 @@ def _intraday_series(ctx, metric, start: dt.date, end: dt.date, truncated: bool)
             **meta,
         )
 
-    return ToolResult.ok(
-        {
-            "metric": metric.name,
-            "unit": metric.unit,
-            "granularity": "intraday",
-            "range": {"start": start.isoformat(), "end": end.isoformat()},
-            "readings": readings,
-        },
-        **meta,
-    )
+    data = {
+        "metric": metric.name,
+        "unit": metric.unit,
+        "granularity": "intraday",
+        "range": {"start": start.isoformat(), "end": end.isoformat()},
+        "bucket_minutes": bucket_minutes,
+        "aggregation": "total" if additive else "min/max/avg",
+        "readings": readings,
+    }
+    if unplaced:
+        data["unplaced_readings"] = unplaced
+
+    return ToolResult.ok(data, **meta)
 
 
 @mcp.tool()
@@ -247,10 +312,12 @@ def get_metric_series(
     Valid metrics: sleep_duration, resting_heart_rate, hrv, steps,
     active_zone_minutes, spo2, skin_temperature_deviation, heart_rate.
 
-    granularity is "daily" (default) or "intraday". Intraday gives
-    minute-level readings and is supported only for heart_rate and steps; it is
-    capped at 7 days regardless of the range requested, and the response says
-    so when it truncates.
+    granularity is "daily" (default) or "intraday". Intraday is supported only
+    for heart_rate and steps. Its readings are aggregated into time buckets
+    (bucket_minutes says how wide, chosen from the range) because the band
+    samples every few seconds — a raw day of heart_rate is ~38,000 points.
+    Additive metrics report a bucket total; rates report min, max and avg.
+    Intraday is capped at 7 days, and the response says so when it truncates.
 
     Dates accept natural language, as in get_daily_summary. Daily results carry
     a trailing baseline drawn from up to 30 days before the requested range,
@@ -308,6 +375,10 @@ def get_metric_series(
         if start <= day <= end
     ]
 
+    meta: dict[str, Any] = {}
+    if series.truncated:
+        meta = {"truncated": True, "reason": series.truncation_reason}
+
     return ToolResult.ok(
         {
             "metric": metric,
@@ -321,7 +392,8 @@ def get_metric_series(
             },
             "baseline": baseline.to_dict(),
             "points": points,
-        }
+        },
+        **meta,
     )
 
 
