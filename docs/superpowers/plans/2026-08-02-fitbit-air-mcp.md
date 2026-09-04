@@ -3940,16 +3940,32 @@ def fake_context(monkeypatch):
 def test_sleep_detail_returns_stage_segments(fake_context):
     from mcp_fitbit_air.server import get_sleep_detail
 
+    # Real shape, from tests/fixtures/list_sleep_nofilter.json. An earlier
+    # version of this brief used sleep.levels[].level with durationSeconds,
+    # which the API never returns and the implementation below never reads -
+    # so the test asserted against a payload that cannot occur.
     fake_context.client.list_data_points.return_value = [
         {
             "sleep": {
-                "durationSeconds": 27000,
-                "levels": [
-                    {"level": "deep", "startTime": "2026-08-01T00:10:00Z", "durationSeconds": 3600},
-                    {"level": "rem", "startTime": "2026-08-01T01:10:00Z", "durationSeconds": 2400},
+                "interval": {
+                    "startTime": "2026-08-01T04:20:00Z",
+                    "endTime": "2026-08-01T10:50:00Z",
+                    "startUtcOffset": "-14400s",
+                    "endUtcOffset": "-14400s",
+                },
+                "metadata": {"mainSleep": True, "stagesStatus": "SUCCEEDED"},
+                "stages": [
+                    {"type": "AWAKE", "startTime": "2026-08-01T04:20:00Z",
+                     "endTime": "2026-08-01T04:23:30Z"},
+                    {"type": "DEEP", "startTime": "2026-08-01T04:23:30Z",
+                     "endTime": "2026-08-01T05:01:30Z"},
                 ],
-            },
-            "interval": {"civilEndTime": "2026-08-01T07:00:00"},
+                "summary": {
+                    "minutesAsleep": "390",
+                    "minutesAwake": "10",
+                    "stagesSummary": [{"type": "DEEP", "minutes": "60", "count": "4"}],
+                },
+            }
         }
     ]
 
@@ -3957,7 +3973,9 @@ def test_sleep_detail_returns_stage_segments(fake_context):
 
     assert result["state"] == "ok"
     assert len(result["data"]["sessions"]) == 1
-    assert result["data"]["sessions"][0]["levels"][0]["level"] == "deep"
+    assert result["data"]["sessions"][0]["stages"][0]["type"] == "AWAKE"
+    # Every minute count arrives as a JSON string and must be coerced.
+    assert result["data"]["sessions"][0]["minutes_asleep"] == 390.0
 
 
 def test_no_sleep_recorded_is_no_data(fake_context):
@@ -4163,13 +4181,16 @@ def query_raw(
     if method == "dailyRollUp":
         points = ctx.client.daily_rollup(data_type, start, end)
     else:
-        field = f"{data_type.replace('-', '_')}.interval.civil_start_time"
-        exclusive_end = end + timedelta(days=1)
-        filter_expr = (
-            f'{field} >= "{start.isoformat()}" AND '
-            f'{field} < "{exclusive_end.isoformat()}"'
-        )
-        points = ctx.client.list_data_points(data_type, filter_expr=filter_expr)
+        # NOTE: an earlier version of this brief built
+        # "{data_type}.interval.civil_start_time" for EVERY type. That matches
+        # none of the eight filter members Phase 0 verified, and the wrong
+        # member returns HTTP 200 with zero rows rather than an error - so
+        # query_raw would have reported "no data" for essentially every
+        # request. Derive from the registry where the type is known, follow the
+        # family pattern where it is not, and say so when a guess comes back
+        # empty. See src/mcp_fitbit_air/server.py::_raw_filter.
+        used_filter, guessed = _raw_filter(data_type, start, end, ctx.timezone)
+        points = ctx.client.list_data_points(data_type, filter_expr=used_filter)
 
     if not points:
         return ToolResult.no_data(

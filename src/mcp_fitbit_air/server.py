@@ -21,9 +21,15 @@ from .baselines import compute_baseline, lookback_start
 from .client import ApiError
 from .config import ConfigError
 from .context import get_context
-from .dates import DateParseError, resolve_range
-from .fetch import ADDITIVE_UNITS, build_filter, fetch_metric
-from .mapping import METRICS, SUMMARY_METRICS, UnknownMetricError, get_metric
+from .dates import DateParseError, resolve_day, resolve_range
+from .fetch import ADDITIVE_UNITS, build_filter, fetch_metric, utc_instant
+from .mapping import (
+    METRICS,
+    SUMMARY_METRICS,
+    UnknownMetricError,
+    coerce_number,
+    get_metric,
+)
 from .results import ResultState, ToolResult
 from .summary import build_summary
 
@@ -392,6 +398,212 @@ def get_metric_series(
             },
             "baseline": baseline.to_dict(),
             "points": points,
+        },
+        **meta,
+    )
+
+
+MAX_RAW_POINTS = 500
+
+
+def _truncation_meta(points) -> dict[str, Any]:
+    """Lift a paginated fetch's truncation flag into tool-result meta."""
+    if getattr(points, "truncated", False):
+        return {
+            "truncated": True,
+            "reason": points.truncation_reason
+            or "The fetch stopped before the end of the range.",
+        }
+    return {}
+
+
+@mcp.tool()
+@tool_guard
+def get_sleep_detail(date: str) -> ToolResult:
+    """Get the full sleep-stage breakdown for a single night.
+
+    Returns each sleep session's stage segments (AWAKE, LIGHT, DEEP, REM) with
+    their start and end times, plus per-stage totals — more detail than
+    get_daily_summary, which reports only total duration. Naps come back as
+    separate sessions; is_main_sleep distinguishes the night itself.
+
+    `date` is the date the sleep ENDED (the morning you woke up), and accepts
+    natural language: "yesterday", "2026-08-01".
+    """
+    ctx = get_context()
+    day = resolve_day(date, ctx.timezone)
+    metric = get_metric("sleep_duration")
+    points = ctx.client.list_data_points(
+        metric.data_type,
+        filter_expr=build_filter(metric, day, day, ctx.timezone),
+    )
+
+    sessions = []
+    for point in points:
+        payload = point.get("sleep") or {}
+        summary = payload.get("summary") or {}
+        # Every minute count arrives as a JSON string; coerce so Claude can
+        # compare and sum them without guessing. coerce_number also rejects the
+        # literal "NaN" the API emits for values it could not compute.
+        sessions.append(
+            {
+                "minutes_asleep": coerce_number(summary.get("minutesAsleep")),
+                "minutes_awake": coerce_number(summary.get("minutesAwake")),
+                "minutes_to_fall_asleep": coerce_number(
+                    summary.get("minutesToFallAsleep")
+                ),
+                "minutes_in_sleep_period": coerce_number(
+                    summary.get("minutesInSleepPeriod")
+                ),
+                "stages_summary": [
+                    {
+                        "type": entry.get("type"),
+                        "minutes": coerce_number(entry.get("minutes")),
+                        "count": coerce_number(entry.get("count")),
+                    }
+                    for entry in summary.get("stagesSummary") or []
+                ],
+                "stages": payload.get("stages", []),
+                "is_main_sleep": (payload.get("metadata") or {}).get("mainSleep"),
+                "interval": payload.get("interval"),
+            }
+        )
+
+    if not sessions:
+        return ToolResult.no_data(
+            f"No sleep recorded for {day.isoformat()}. The band may not have been "
+            "worn overnight, or may not have synced."
+        )
+
+    return ToolResult.ok(
+        {"date": day.isoformat(), "sessions": sessions}, **_truncation_meta(points)
+    )
+
+
+# data_type -> the registry entry that already knows its verified filter.
+_METRIC_BY_DATA_TYPE = {metric.data_type: metric for metric in METRICS.values()}
+
+
+def _raw_filter(data_type: str, start: dt.date, end: dt.date, tz) -> tuple[str, bool]:
+    """Build a list filter for an arbitrary data type.
+
+    Returns the expression and whether it was guessed. This matters because the
+    wrong dialect does not error — it returns HTTP 200 with zero rows, which
+    reads exactly like "no data". Registry-backed types reuse their verified
+    member; anything else follows the pattern its family used in Phase 0, and
+    the caller is told the filter was a guess if nothing comes back.
+    """
+    known = _METRIC_BY_DATA_TYPE.get(data_type)
+    if known is not None:
+        return build_filter(known, start, end, tz), False
+
+    member_root = data_type.replace("-", "_")
+    exclusive_end = end + timedelta(days=1)
+    if data_type.startswith("daily-"):
+        # Every verified daily-* type filters on <snake_type>.date with civil dates.
+        member = f"{member_root}.date"
+        lower, upper = start.isoformat(), exclusive_end.isoformat()
+    else:
+        member = f"{member_root}.interval.start_time"
+        lower = utc_instant(start, tz)
+        upper = utc_instant(exclusive_end, tz)
+    return f'{member} >= "{lower}" AND {member} < "{upper}"', True
+
+
+@mcp.tool()
+@tool_guard
+def query_raw(
+    data_type: str,
+    start_date: str,
+    end_date: str | None = None,
+    method: str = "list",
+    filter_expr: str | None = None,
+) -> ToolResult:
+    """Escape hatch: query any Google Health API data type directly.
+
+    Use this only when no other tool covers what is needed — the other tools
+    return cleaner, better-labelled data.
+
+    `data_type` is a Google Health API identifier, for example: distance,
+    floors, total-calories, exercise, active-minutes, daily-vo2-max,
+    daily-respiratory-rate, sedentary-period, weight, altitude.
+
+    `method` is "list" (default) or "dailyRollUp" (per-day aggregation). Not
+    every data type supports both: cumulative types such as floors and distance
+    reject "list" outright and must be queried with "dailyRollUp". If a request
+    is refused for that reason, the response says which method to use instead.
+
+    Filters differ per data type and the wrong one returns zero rows rather
+    than an error, so the filter is derived from the type. If a derived filter
+    returns nothing, the response says which one it used; pass `filter_expr` to
+    override it with an exact AIP-160 expression.
+
+    Results are truncated at 500 data points.
+    """
+    # Checked before get_context() so a typo fails on its own terms rather than
+    # as an authentication error.
+    if method not in {"list", "dailyRollUp"}:
+        return ToolResult.error(
+            f"Unknown method {method!r}. Use \"list\" or \"dailyRollUp\"."
+        )
+
+    ctx = get_context()
+    start, end = resolve_range(start_date, end_date, ctx.timezone)
+
+    guessed = False
+    used_filter = None
+    if method == "dailyRollUp":
+        points = ctx.client.daily_rollup(data_type, start, end)
+    else:
+        if filter_expr:
+            used_filter = filter_expr
+        else:
+            used_filter, guessed = _raw_filter(data_type, start, end, ctx.timezone)
+        try:
+            points = ctx.client.list_data_points(data_type, filter_expr=used_filter)
+        except ApiError as exc:
+            # Cumulative types reject list with a 400 that names the methods they
+            # do support. Left to tool_guard this arrives as a bare API error;
+            # turning it into an actionable remedy saves a guessing round.
+            if "dailyrollup" in str(exc).lower():
+                return ToolResult.error(
+                    str(exc),
+                    remedy=(
+                        f"{data_type} does not support list. Retry with "
+                        'method="dailyRollUp".'
+                    ),
+                )
+            raise
+
+    if not points:
+        message = (
+            f"No {data_type} data between {start.isoformat()} and {end.isoformat()}."
+        )
+        if guessed:
+            message += (
+                f" Note that the filter was derived rather than verified for this "
+                f"data type: {used_filter}. An unsupported filter member returns "
+                "zero rows rather than an error, so this may mean the filter is "
+                "wrong rather than that the range is empty. Pass filter_expr to "
+                "override it."
+            )
+        return ToolResult.no_data(message)
+
+    meta = _truncation_meta(points)
+    if len(points) > MAX_RAW_POINTS:
+        reason = f"Truncated to the first {MAX_RAW_POINTS} of {len(points)} points."
+        meta = {
+            "truncated": True,
+            "reason": f"{meta['reason']} {reason}" if meta else reason,
+        }
+
+    return ToolResult.ok(
+        {
+            "data_type": data_type,
+            "method": method,
+            "range": {"start": start.isoformat(), "end": end.isoformat()},
+            "filter": used_filter,
+            "dataPoints": points[:MAX_RAW_POINTS],
         },
         **meta,
     )

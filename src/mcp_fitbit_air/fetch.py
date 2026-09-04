@@ -50,7 +50,7 @@ def point_date(metric: Metric, point: dict) -> date | None:
     return metric.date_of(point)
 
 
-def _utc_instant(day: date, tz: ZoneInfo) -> str:
+def utc_instant(day: date, tz: ZoneInfo) -> str:
     """Local midnight on `day`, expressed as an RFC-3339 UTC instant."""
     local = datetime.combine(day, time.min, tzinfo=tz)
     return local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -63,8 +63,8 @@ def build_filter(metric: Metric, start: date, end: date, tz: ZoneInfo) -> str:
     member = metric.filter_member
 
     if metric.filter_dialect == "physical":
-        lower = _utc_instant(start, tz)
-        upper = _utc_instant(exclusive_end, tz)
+        lower = utc_instant(start, tz)
+        upper = utc_instant(exclusive_end, tz)
     else:  # "civil_date"
         lower = start.isoformat()
         upper = exclusive_end.isoformat()
