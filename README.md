@@ -81,7 +81,30 @@ wins.
 
 ### 4. Register with Claude
 
-Add to your MCP client configuration (for Claude Desktop,
+Whichever client you use, give the **absolute path** to the console script
+inside your virtualenv. MCP clients do not run your shell profile, so a bare
+`mcp-fitbit-air` will usually not be found. `python -m mcp_fitbit_air serve`
+works equally well, given the venv's own `python`.
+
+#### Claude Code
+
+```bash
+claude mcp add fitbit-air -- /absolute/path/to/mcp-fitbit-air/.venv/bin/mcp-fitbit-air serve
+```
+
+Claude Code starts the server with your project directory as its working
+directory, so `.env` is found automatically and **no credentials need to go
+into any config file**. Confirm with `claude mcp get fitbit-air`, which should
+report `Connected`.
+
+The default scope is `local` — private to you, in this project. Add
+`--scope user` to make it available in every project, or `--scope project` to
+write a committed `.mcp.json` for anyone who clones the repo. A committed
+`.mcp.json` must never carry credentials; leave them to each user's `.env`.
+
+#### Claude Desktop and other clients
+
+Add to the client's MCP configuration (for Claude Desktop, this is
 `claude_desktop_config.json`):
 
 ```json
@@ -99,10 +122,9 @@ Add to your MCP client configuration (for Claude Desktop,
 }
 ```
 
-Use the **absolute path** to the console script inside your virtualenv. MCP
-clients do not run your shell profile, so a bare `mcp-fitbit-air` will usually
-not be found. `python -m mcp_fitbit_air serve` works too, given the venv's own
-`python`.
+The `env` block is needed here because such a client generally launches the
+server from somewhere other than the project directory, where `.env` will not
+be found. Real environment variables take precedence over `.env` in any case.
 
 Restart the client, then ask: *"Is my Fitbit synced?"*
 
