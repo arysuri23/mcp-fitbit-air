@@ -24,7 +24,7 @@ def series(name, by_day, state=ResultState.OK, message=None):
 
 def fake_fetch(fake):
     """Stand in for fetch_metric, ignoring the range it is handed."""
-    return lambda client, name, start, end, tz: fake[name]
+    return lambda client, name, start, end, tz, **kwargs: fake[name]
 
 
 def test_summary_has_one_row_per_day_in_range():
@@ -123,7 +123,7 @@ def test_baseline_draws_on_days_before_the_requested_range():
     """The mean must include the lookback days, not just the emitted rows."""
     calls = []
 
-    def fetch(client, name, start, end, tz):
+    def fetch(client, name, start, end, tz, **kwargs):
         calls.append((start, end))
         return series(
             "steps",
@@ -146,7 +146,7 @@ def test_baseline_draws_on_days_before_the_requested_range():
 def test_fetch_window_is_widened_backwards_by_the_lookback():
     calls = []
 
-    def fetch(client, name, start, end, tz):
+    def fetch(client, name, start, end, tz, **kwargs):
         calls.append((start, end))
         return series("steps", {})
 
@@ -163,7 +163,7 @@ def test_lookback_shrinks_so_the_fetch_never_exceeds_the_api_cap():
     5 lookback days, not 30 - overshooting would make the API reject the call."""
     calls = []
 
-    def fetch(client, name, start, end, tz):
+    def fetch(client, name, start, end, tz, **kwargs):
         calls.append((start, end))
         return series("steps", {})
 
@@ -439,3 +439,83 @@ def test_metric_status_reports_a_truncated_fetch(fake_context):
     assert "50-page" in result["metric_status"]["steps"]["reason"]
     # A complete metric stays quiet rather than carrying truncated=False noise.
     assert "truncated" not in result["metric_status"]["hrv"]
+
+
+# -- Review findings ----------------------------------------------------------
+
+
+def test_summary_reports_warming_up_through_the_widened_window(fake_context):
+    """build_summary widens the fetch window for baselines; that must not make
+    the warm-up state unreachable for the caller's actual question."""
+    client = Mock()
+    client.list_data_points.return_value = []
+    client.daily_rollup.return_value = []
+
+    result = build_summary(client, date(2026, 1, 1), date(2026, 1, 3), ["hrv"], TZ)
+
+    assert result["metric_status"]["hrv"]["state"] == "warming_up"
+
+
+def test_summary_baseline_window_reports_its_trailing_days():
+    fake = {"steps": series("steps", {date(2026, 8, 1): 9000})}
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=fake_fetch(fake)):
+        result = build_summary(Mock(), date(2026, 8, 1), date(2026, 8, 2), ["steps"], TZ)
+
+    assert result["baseline_window"]["trailing_days"] == BASELINE_LOOKBACK_DAYS
+
+
+def test_metric_status_error_cell_carries_the_remedy(fake_context):
+    from mcp_fitbit_air.client import ApiError
+
+    client = Mock()
+    client.list_data_points.side_effect = ApiError(
+        "rejected (401)", status=401, remedy="Run `mcp-fitbit-air auth` to re-authenticate."
+    )
+    client.daily_rollup.side_effect = client.list_data_points.side_effect
+
+    result = build_summary(client, date(2026, 8, 1), date(2026, 8, 2), ["hrv"], TZ)
+
+    assert result["metric_status"]["hrv"]["remedy"].startswith("Run `mcp-fitbit-air auth`")
+
+
+def test_a_total_failure_surfaces_the_shared_remedy(fake_context):
+    """When every metric failed for the same reason, that reason's fix is the
+    tool's answer - not something buried in seven per-metric cells."""
+    from mcp_fitbit_air.server import get_daily_summary
+
+    remedy = "Run `mcp-fitbit-air auth` to re-authenticate."
+    fake = {}
+    for name in _all_summary_names():
+        s = series(name, {}, state=ResultState.ERROR, message="rejected (401)")
+        s.remedy = remedy
+        fake[name] = s
+
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=fake_fetch(fake)):
+        result = get_daily_summary("2026-08-01", "2026-08-02")
+
+    assert result["state"] == "error"
+    assert result["remedy"] == remedy
+
+
+def test_conflicting_remedies_are_not_reduced_to_one(fake_context):
+    """Picking an arbitrary remedy when metrics failed for different reasons is
+    worse than offering none: it is confident advice that fixes only some of it.
+    The per-metric cells still carry each one."""
+    from mcp_fitbit_air.server import get_daily_summary
+
+    names = _all_summary_names()
+    fake = {}
+    for index, name in enumerate(names):
+        s = series(name, {}, state=ResultState.ERROR, message="failed")
+        s.remedy = "Run `mcp-fitbit-air auth`." if index % 2 else "Wait and retry."
+        fake[name] = s
+
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=fake_fetch(fake)):
+        result = get_daily_summary("2026-08-01", "2026-08-02")
+
+    assert result["state"] == "error"
+    assert "remedy" not in result
+    assert {c["remedy"] for c in result["metric_status"].values()} == {
+        "Run `mcp-fitbit-air auth`.",
+        "Wait and retry.",
+    }

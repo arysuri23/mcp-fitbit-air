@@ -40,13 +40,20 @@ class ServerContext:
         This comes from `users/me/settings`, NOT the profile - Phase 0 confirmed
         the profile response carries no timezone field of any kind.
         """
-        if self._timezone is None:
-            try:
-                name = self.client.get_settings().get("timeZone")
-                self._timezone = ZoneInfo(name) if name else DEFAULT_TIMEZONE
-            except (ApiError, KeyError, ValueError, ZoneInfoNotFoundError) as exc:
-                logger.warning("Falling back to UTC; could not read settings timeZone: %s", exc)
-                self._timezone = DEFAULT_TIMEZONE
+        if self._timezone is not None:
+            return self._timezone
+        try:
+            name = self.client.get_settings().get("timeZone")
+            resolved = ZoneInfo(name) if name else DEFAULT_TIMEZONE
+        except (ApiError, KeyError, ValueError, ZoneInfoNotFoundError) as exc:
+            logger.warning("Falling back to UTC; could not read settings timeZone: %s", exc)
+            # Deliberately NOT cached. This object lives for the whole process,
+            # so caching the fallback would let one transient 500 on the first
+            # tool call pin every later date resolution and every physical-time
+            # filter to UTC until the server was restarted - silently, and off
+            # by the user's entire offset.
+            return DEFAULT_TIMEZONE
+        self._timezone = resolved
         return self._timezone
 
 

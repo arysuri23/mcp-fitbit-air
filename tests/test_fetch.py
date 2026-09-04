@@ -236,3 +236,104 @@ def test_fetch_metric_reports_a_complete_fetch_as_untruncated():
 
     assert series.truncated is False
     assert series.truncation_reason is None
+
+
+# -- Warm-up must be reachable through the tools that use a widened window ----
+#
+# Found in review. fetch_metric judged warm-up from the window it was handed,
+# but both tools hand it a window widened by up to 30 days for the baseline. A
+# 7-day request became a 37-day window, so hrv's threshold of 6 could never
+# trip and a days-old account was told "no data" instead of "warming up" - the
+# single scenario the state exists for.
+
+
+def test_warming_up_is_judged_by_the_requested_range_not_the_fetch_window():
+    from datetime import date
+
+    from mcp_fitbit_air.fetch import fetch_metric
+
+    client = Mock()
+    client.list_data_points.return_value = []
+
+    series = fetch_metric(
+        client,
+        "hrv",
+        date(2026, 1, 1),   # widened start, 30 days before the request
+        date(2026, 2, 6),
+        TZ,
+        requested_days=3,   # what the caller actually asked about
+    )
+
+    assert series.state is ResultState.WARMING_UP
+    assert "nights" in series.message
+
+
+def test_a_long_requested_range_is_still_no_data():
+    """Asking about a month and getting nothing is absence, not warm-up - the
+    band would have had ample time to compute it."""
+    from datetime import date
+
+    from mcp_fitbit_air.fetch import fetch_metric
+
+    client = Mock()
+    client.list_data_points.return_value = []
+
+    series = fetch_metric(
+        client, "hrv", date(2026, 1, 1), date(2026, 2, 6), TZ, requested_days=30
+    )
+
+    assert series.state is ResultState.NO_DATA
+
+
+def test_requested_days_defaults_to_the_fetched_window():
+    """Callers that do not widen anything should not have to say so twice."""
+    from datetime import date
+
+    from mcp_fitbit_air.fetch import fetch_metric
+
+    client = Mock()
+    client.list_data_points.return_value = []
+
+    series = fetch_metric(client, "hrv", date(2026, 1, 1), date(2026, 1, 3), TZ)
+
+    assert series.state is ResultState.WARMING_UP
+
+
+# -- The remedy is the most actionable thing an error carries -----------------
+#
+# Found in review. fetch_metric kept ApiError's message and dropped its remedy,
+# so a 401 mid-session reported "the API rejected our credentials" without the
+# one line that says what to do about it - while the intraday path, which lets
+# ApiError reach tool_guard, reported it correctly. Same tool, same failure,
+# different answer.
+
+
+def test_fetch_metric_preserves_the_remedy_from_an_api_error():
+    from datetime import date
+
+    from mcp_fitbit_air.fetch import fetch_metric
+
+    client = Mock()
+    client.list_data_points.side_effect = ApiError(
+        "The Health API rejected our credentials (401): Invalid Credentials",
+        status=401,
+        remedy="Run `mcp-fitbit-air auth` to re-authenticate.",
+    )
+
+    series = fetch_metric(client, "hrv", date(2026, 8, 1), date(2026, 8, 2), TZ)
+
+    assert series.state is ResultState.ERROR
+    assert series.remedy == "Run `mcp-fitbit-air auth` to re-authenticate."
+
+
+def test_an_error_without_a_remedy_leaves_it_unset():
+    from datetime import date
+
+    from mcp_fitbit_air.fetch import fetch_metric
+
+    client = Mock()
+    client.list_data_points.side_effect = ApiError("Backend error", status=500)
+
+    series = fetch_metric(client, "hrv", date(2026, 8, 1), date(2026, 8, 2), TZ)
+
+    assert series.remedy is None

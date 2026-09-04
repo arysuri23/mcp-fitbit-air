@@ -31,7 +31,7 @@ from .mapping import (
     get_metric,
 )
 from .results import ResultState, ToolResult
-from .summary import build_summary
+from .summary import baseline_window, build_summary
 
 logger = logging.getLogger(__name__)
 
@@ -175,9 +175,15 @@ def get_daily_summary(start_date: str, end_date: str | None = None) -> ToolResul
         }
     )
     if failures:
+        # When every metric failed for the same reason, that reason's fix is the
+        # answer — not something to be dug out of seven per-metric cells.
+        remedies = {
+            status["remedy"] for status in statuses.values() if status.get("remedy")
+        }
         return ToolResult.error(
             f"Could not fetch health data for {start.isoformat()} to "
             f"{end.isoformat()}: {'; '.join(failures)}",
+            remedy=remedies.pop() if len(remedies) == 1 else None,
             **summary,
         )
 
@@ -244,19 +250,28 @@ def _bucket_minutes(start: dt.date, end: dt.date) -> int:
     return BUCKET_CHOICES_MINUTES[-1]
 
 
-def _floor_to_bucket(moment: str, minutes: int) -> str | None:
-    """Floor an RFC-3339 instant onto a bucket boundary, or None if unparseable."""
+def _floor_to_bucket(moment: str, minutes: int, tz) -> str | None:
+    """Floor an RFC-3339 instant onto a bucket boundary in the user's local time.
+
+    The API returns physical instants in UTC, but every other date in the
+    response is a local calendar date. Labelling buckets in UTC left the two
+    incomparable — a request for one local day came back with buckets spanning
+    two UTC dates, and nothing in the payload said what the offset was. Flooring
+    on the local wall clock also keeps bucket boundaries on round local times
+    for offsets that are not whole hours.
+    """
     try:
         parsed = dt.datetime.fromisoformat(moment.replace("Z", "+00:00"))
-    except (AttributeError, ValueError):
+    except (AttributeError, ValueError, TypeError):
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=dt.timezone.utc)
-    epoch_minutes = int(parsed.timestamp() // 60)
-    floored = (epoch_minutes // minutes) * minutes
-    return dt.datetime.fromtimestamp(floored * 60, tz=dt.timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
+    local = parsed.astimezone(tz)
+    minute_of_day = (local.hour * 60 + local.minute) // minutes * minutes
+    floored = local.replace(
+        hour=minute_of_day // 60, minute=minute_of_day % 60, second=0, microsecond=0
     )
+    return floored.isoformat()
 
 
 def _summarise_bucket(time_label: str, values: list[float], additive: bool) -> dict:
@@ -290,7 +305,7 @@ def _intraday_series(ctx, metric, start: dt.date, end: dt.date, truncated: bool)
         value = metric.extract(point)
         if value is None:
             continue
-        label = _floor_to_bucket(_reading_time(point) or "", bucket_minutes)
+        label = _floor_to_bucket(_reading_time(point) or "", bucket_minutes, ctx.timezone)
         if label is None:
             # A reading with no resolvable timestamp cannot be placed in time.
             # Counted rather than dropped silently, so a systematic shape change
@@ -301,7 +316,9 @@ def _intraday_series(ctx, metric, start: dt.date, end: dt.date, truncated: bool)
 
     readings = [
         _summarise_bucket(label, values, additive)
-        for label, values in sorted(buckets.items())
+        for label, values in sorted(
+            buckets.items(), key=lambda item: dt.datetime.fromisoformat(item[0])
+        )
     ]
 
     meta: dict[str, Any] = {}
@@ -317,17 +334,27 @@ def _intraday_series(ctx, metric, start: dt.date, end: dt.date, truncated: bool)
         meta = {"truncated": True, "reason": " ".join(reasons)}
 
     if not readings:
-        return ToolResult.no_data(
+        message = (
             f"No intraday {metric.name} recorded between {start.isoformat()} and "
-            f"{end.isoformat()}.",
-            **meta,
+            f"{end.isoformat()}."
         )
+        if unplaced:
+            # Readings did arrive; none carried a timestamp this code could
+            # read. Reporting a bare "nothing recorded" here would hide exactly
+            # the field rename the counter was added to catch.
+            message += (
+                f" {unplaced} readings were returned but none carried a usable "
+                "timestamp, which usually means the API changed shape."
+            )
+            meta = {**meta, "unplaced_readings": unplaced}
+        return ToolResult.no_data(message, **meta)
 
     data = {
         "metric": metric.name,
         "unit": metric.unit,
         "granularity": "intraday",
         "range": {"start": start.isoformat(), "end": end.isoformat()},
+        "timezone": str(ctx.timezone),
         "bucket_minutes": bucket_minutes,
         "aggregation": "total" if additive else "min/max/avg",
         "readings": readings,
@@ -396,14 +423,27 @@ def get_metric_series(
     # the same days being asked about. Those extra days inform the baseline and
     # are then dropped from `points`.
     fetch_start = lookback_start(start, end, [metric])
-    series = fetch_metric(ctx.client, metric, fetch_start, end, ctx.timezone)
+    series = fetch_metric(
+        ctx.client, metric, fetch_start, end, ctx.timezone, requested_days=span
+    )
+
+    # Built before any return: a fetch that stopped early has to say so on every
+    # path out of here, not just the successful one. "No data in this range" and
+    # "we stopped looking before we got there" are different answers.
+    meta: dict[str, Any] = {}
+    if series.truncated:
+        meta = {"truncated": True, "reason": series.truncation_reason}
 
     if series.state is ResultState.ERROR:
-        return ToolResult.error(series.message or "Failed to fetch metric.")
+        return ToolResult.error(
+            series.message or "Failed to fetch metric.", remedy=series.remedy
+        )
     if series.state is ResultState.WARMING_UP:
-        return ToolResult.warming_up(series.message, warmup_nights=spec.warmup_nights)
+        return ToolResult.warming_up(
+            series.message, warmup_nights=spec.warmup_nights, **meta
+        )
     if series.state is ResultState.NO_DATA:
-        return ToolResult.no_data(series.message)
+        return ToolResult.no_data(series.message, **meta)
 
     baseline = compute_baseline(
         list(series.by_day.values()), window_days=(end - fetch_start).days + 1
@@ -413,10 +453,15 @@ def get_metric_series(
         for day, value in sorted(series.by_day.items())
         if start <= day <= end
     ]
-
-    meta: dict[str, Any] = {}
-    if series.truncated:
-        meta = {"truncated": True, "reason": series.truncation_reason}
+    if not points:
+        # by_day spans the widened baseline window, so it can be non-empty while
+        # the requested range is not. Reporting ok with an empty list would hand
+        # Claude a baseline and nothing to say about it.
+        return ToolResult.no_data(
+            f"No {metric} recorded between {start.isoformat()} and "
+            f"{end.isoformat()}, though there are values before that range.",
+            **meta,
+        )
 
     return ToolResult.ok(
         {
@@ -424,11 +469,9 @@ def get_metric_series(
             "unit": spec.unit,
             "granularity": "daily",
             "range": {"start": start.isoformat(), "end": end.isoformat()},
-            "baseline_window": {
-                "start": fetch_start.isoformat(),
-                "end": end.isoformat(),
-                "days": (end - fetch_start).days + 1,
-            },
+            "baseline_window": baseline_window(
+                fetch_start, start, end, (end - fetch_start).days + 1
+            ),
             "baseline": baseline.to_dict(),
             "points": points,
         },
