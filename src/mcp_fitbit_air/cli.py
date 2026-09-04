@@ -45,3 +45,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     return 2
+
+
+# Without this, `python -m mcp_fitbit_air.cli serve` imports the module and
+# exits 0 having done nothing — which looks exactly like a server that started
+# and immediately went quiet. See also __main__.py, which makes the shorter
+# `python -m mcp_fitbit_air` work the same way.
+if __name__ == "__main__":
+    raise SystemExit(main())

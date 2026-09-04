@@ -159,14 +159,47 @@ def get_daily_summary(start_date: str, end_date: str | None = None) -> ToolResul
         for day in summary["days"]
         for cell in day["metrics"].values()
     )
-    if not has_any:
-        return ToolResult.no_data(
-            f"No health data recorded between {start.isoformat()} and {end.isoformat()}. "
-            "Check that the Fitbit Air has synced recently with get_profile_and_devices.",
+    if has_any:
+        return ToolResult.ok(summary)
+
+    # An empty table has to say which kind of empty it is. Reporting no_data for
+    # all three sends the user to check their band's sync when the real cause
+    # was an outage, an expired token, or simply a device too new to have
+    # computed anything yet.
+    statuses = summary["metric_status"]
+    failures = sorted(
+        {
+            status["message"]
+            for status in statuses.values()
+            if status["state"] == "error" and status.get("message")
+        }
+    )
+    if failures:
+        return ToolResult.error(
+            f"Could not fetch health data for {start.isoformat()} to "
+            f"{end.isoformat()}: {'; '.join(failures)}",
             **summary,
         )
 
-    return ToolResult.ok(summary)
+    if all(status["state"] == "warming_up" for status in statuses.values()):
+        return ToolResult.warming_up(
+            "; ".join(
+                sorted(
+                    {
+                        status["message"]
+                        for status in statuses.values()
+                        if status.get("message")
+                    }
+                )
+            ),
+            **summary,
+        )
+
+    return ToolResult.no_data(
+        f"No health data recorded between {start.isoformat()} and {end.isoformat()}. "
+        "Check that the Fitbit Air has synced recently with get_profile_and_devices.",
+        **summary,
+    )
 
 
 MAX_INTRADAY_DAYS = 7
