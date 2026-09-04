@@ -572,7 +572,7 @@ class Config:
 pytest tests/test_config.py -v
 ```
 
-Expected: PASS — 4 passed
+Expected: PASS — 6 passed
 
 - [ ] **Step 6: Commit**
 
