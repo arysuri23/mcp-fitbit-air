@@ -1196,6 +1196,7 @@ Three things about this API make a naive mapping wrong:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -1207,17 +1208,32 @@ class UnknownMetricError(Exception):
 
 
 def coerce_number(value: Any) -> float | None:
-    """Coerce an API value to a float. Integers arrive as JSON strings."""
+    """Coerce an API value to a finite float, or None.
+
+    Two things make this load-bearing rather than defensive padding:
+
+    - Integers arrive as JSON strings throughout this API ("8630", "61").
+    - The API returns the literal string "NaN" for fields it cannot compute
+      yet, e.g. baselineTemperatureCelsius before enough nights of history.
+      Python's float("NaN") accepts that happily, and a NaN would poison every
+      average it reached and serialise as bare `NaN` — which is invalid JSON,
+      on a stdout stream that carries the MCP protocol.
+
+    Returning None for non-finite values is the correct semantic: the layers
+    above already render a missing value as no_data rather than inventing one.
+    """
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
+        number = float(value)
+    elif isinstance(value, str):
         try:
-            return float(value)
+            number = float(value)
         except ValueError:
             return None
-    return None
+    else:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def dig(point: dict, *path: str) -> Any:
@@ -1789,14 +1805,22 @@ class ToolResult:
         return cls(state=ResultState.ERROR, message=message, remedy=remedy, meta=meta)
 
     def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"state": self.state.value}
+        """Serialise for the MCP stream.
+
+        Meta goes down FIRST and the authoritative fields are written over it.
+        `state` is not a named parameter on any constructor, so without this
+        ordering a caller could pass state="ok" as a meta kwarg and have an
+        error serialise as a success — defeating the one guarantee this module
+        exists to provide.
+        """
+        payload: dict[str, Any] = dict(self.meta)
+        payload["state"] = self.state.value
         if self.data is not None:
             payload["data"] = self.data
         if self.message is not None:
             payload["message"] = self.message
         if self.remedy is not None:
             payload["remedy"] = self.remedy
-        payload.update(self.meta)
         return payload
 ```
 
