@@ -87,6 +87,13 @@ PRESERVE_VALUES = {"NaN", "Infinity", "-Infinity"}
 
 CIVIL_KEYS = {"year", "month", "day"}
 
+# (parent, key) pairs that SYNTHETIC must not touch, because the same field name
+# means something different here. `minutes` is a sleep-stage duration almost
+# everywhere, but inside a CivilTime it is the minute of the hour - and
+# synthesising 60 there produced fixtures the real API could never emit, which
+# is precisely the vacuous shape these fixtures exist to rule out.
+NEVER_SYNTHESISED = {("time", "minutes"), ("time", "hours"), ("time", "seconds")}
+
 
 def _iter_dates(text: str) -> list[date]:
     found = []
@@ -125,8 +132,10 @@ def shift_text(text: str, shift: timedelta) -> str:
     return DATE_RE.sub(replace, text)
 
 
-def synth(key: str | None, value):
+def synth(key: str | None, value, parent: str | None = None):
     """Replace a health reading, preserving its JSON type."""
+    if (parent, key) in NEVER_SYNTHESISED:
+        return value
     if key not in SYNTHETIC:
         return value
     replacement = SYNTHETIC[key]
@@ -143,13 +152,17 @@ def synth(key: str | None, value):
     return value
 
 
-def scrub(node, shift: timedelta, key: str | None = None):
+def scrub(node, shift: timedelta, key: str | None = None, parent: str | None = None):
     if isinstance(node, dict):
         if CIVIL_KEYS <= node.keys():
             try:
                 moved = date(int(node["year"]), int(node["month"]), int(node["day"])) + shift
                 return {
-                    **{k: scrub(v, shift, k) for k, v in node.items() if k not in CIVIL_KEYS},
+                    **{
+                        k: scrub(v, shift, k, key)
+                        for k, v in node.items()
+                        if k not in CIVIL_KEYS
+                    },
                     "year": moved.year,
                     "month": moved.month,
                     "day": moved.day,
@@ -157,15 +170,19 @@ def scrub(node, shift: timedelta, key: str | None = None):
             except (TypeError, ValueError):
                 pass
         return {
-            k: (f"redacted-{k}" if k in ID_KEYS and isinstance(v, str) else scrub(v, shift, k))
+            k: (
+                f"redacted-{k}"
+                if k in ID_KEYS and isinstance(v, str)
+                else scrub(v, shift, k, key)
+            )
             for k, v in node.items()
         }
     if isinstance(node, list):
-        return [scrub(item, shift, key) for item in node]
+        return [scrub(item, shift, key, parent) for item in node]
     if isinstance(node, str):
-        return synth(key, node) if key in SYNTHETIC else shift_text(node, shift)
+        return synth(key, node, parent) if key in SYNTHETIC else shift_text(node, shift)
     if isinstance(node, (int, float)) and not isinstance(node, bool):
-        return synth(key, node)
+        return synth(key, node, parent)
     return node
 
 

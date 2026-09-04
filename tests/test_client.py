@@ -497,3 +497,20 @@ def test_daily_rollup_stops_at_max_pages(client):
 
     assert len(responses.calls) == MAX_PAGES
     assert [p["steps"]["count"] for p in points] == list(range(MAX_PAGES))
+
+
+def test_an_empty_paired_devices_list_is_an_answer_not_a_fallback(monkeypatch):
+    """`devices` is the fallback for an older payload that lacks `pairedDevices`
+    entirely. An account with no devices returns an empty list, and truthiness
+    would silently fall through to whatever sibling key happened to be present."""
+    client = HealthClient(credentials=None, session=None)
+    monkeypatch.setattr(
+        HealthClient,
+        "_request",
+        lambda self, method, url, **kw: {
+            "pairedDevices": [],
+            "devices": [{"deviceType": "STALE"}],
+        },
+    )
+
+    assert client.get_paired_devices() == []

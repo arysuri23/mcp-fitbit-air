@@ -190,7 +190,13 @@ class HealthClient:
 
     def get_paired_devices(self) -> list[dict[str, Any]]:
         payload = self._request("GET", f"{BASE_URL}/users/me/pairedDevices")
-        return payload.get("pairedDevices", []) or payload.get("devices", [])
+        # Presence, not truthiness: `devices` is the fallback for an OLD payload
+        # that lacks `pairedDevices` entirely. An empty `pairedDevices` is a real
+        # answer - this account has no devices - and must not fall through to a
+        # stale sibling key.
+        if "pairedDevices" in payload:
+            return payload["pairedDevices"]
+        return payload.get("devices", [])
 
     def list_data_points(
         self,
