@@ -19,11 +19,17 @@ Three things about this API make a naive mapping wrong:
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
+
+# stdout carries the MCP protocol stream; a stray print() there would corrupt
+# the session. Logging is safe: getLogger() with no handler attached here
+# just propagates to the root logger, which the server configures to stderr.
+logger = logging.getLogger(__name__)
 
 
 class UnknownMetricError(Exception):
@@ -114,6 +120,26 @@ def _offset_date_at(
     return read
 
 
+def _first(*readers: Callable[[dict], Any]) -> Callable[[dict], Any]:
+    """Try each reader in turn; return the first non-None result.
+
+    Several Google Health data types return DIFFERENT payload shapes
+    depending on whether they were fetched via `dailyRollUp` or `list` (see
+    module docstring). The key names never collide between the two shapes
+    for any metric we support, so trying each reader in order and taking
+    the first hit is safe: at most one of them will ever find its keys.
+    """
+
+    def read(point: dict) -> Any:
+        for reader in readers:
+            result = reader(point)
+            if result is not None:
+                return result
+        return None
+
+    return read
+
+
 def _skin_temperature_deviation(point: dict) -> float | None:
     """Derived: the API returns nightly and baseline, never the deviation."""
     payload = point.get("dailySleepTemperatureDerivations") or {}
@@ -124,15 +150,81 @@ def _skin_temperature_deviation(point: dict) -> float | None:
     return round(nightly - baseline, 3)
 
 
+_AZM_ROLLUP_KEYS = (
+    "sumInFatBurnHeartZone",
+    "sumInCardioHeartZone",
+    "sumInPeakHeartZone",
+)
+
+
 def _active_zone_minutes(point: dict) -> float | None:
-    """Fitbit's headline AZM counts cardio and peak double, fat burn single."""
+    """dailyRollUp shape: per-zone sums. Fitbit's headline AZM counts cardio
+    and peak double, fat burn single.
+
+    Must return None (not 0.0) when none of the rollup sum keys are present,
+    so `_first` correctly falls through to the list-shape reader instead of
+    stopping here with a false zero — the list shape's "activeZoneMinutes"
+    payload has no sum* keys at all, only a single per-minute value.
+    """
     payload = point.get("activeZoneMinutes")
     if not isinstance(payload, dict):
+        return None
+    if not any(key in payload for key in _AZM_ROLLUP_KEYS):
         return None
     fat = coerce_number(payload.get("sumInFatBurnHeartZone")) or 0.0
     cardio = coerce_number(payload.get("sumInCardioHeartZone")) or 0.0
     peak = coerce_number(payload.get("sumInPeakHeartZone")) or 0.0
     return fat + 2 * (cardio + peak)
+
+
+# list shape: one per-minute record, weighted the same way Fitbit weights the
+# rollup sums, so a summed series matches the rollup's headline number.
+_AZM_ZONE_WEIGHT = {"FAT_BURN": 1.0, "CARDIO": 2.0, "PEAK": 2.0}
+
+# Labels we've already warned about. Intraday AZM responses can carry
+# hundreds of per-minute records; without this, a session with one
+# unanticipated zone label would emit hundreds of identical warnings for
+# zero extra information. Keyed by repr() so a non-string (or unhashable)
+# label can never raise from the cache lookup itself.
+_AZM_WARNED_ZONES: set[str] = set()
+
+
+def _warn_unrecognised_azm_zone(zone: Any) -> None:
+    """Skipping an unrecognised zone is the right call — misweighting it
+    would corrupt the total, and guessing is worse than a gap. But a silent
+    skip is exactly the failure mode this whole fix exists to close, so log
+    it once per unique label (not once per data point) with the label
+    verbatim, so it's actionable without re-deriving the problem."""
+    key = repr(zone)
+    if key in _AZM_WARNED_ZONES:
+        return
+    _AZM_WARNED_ZONES.add(key)
+    logger.warning(
+        "active_zone_minutes: unrecognised heartRateZone label %r in a "
+        "list-shape data point; its minutes are excluded from the total "
+        "rather than misweighted. Known labels: %s.",
+        zone,
+        sorted(_AZM_ZONE_WEIGHT),
+    )
+
+
+def _active_zone_minutes_list(point: dict) -> float | None:
+    """list shape: a single per-minute record with a zone label, e.g.
+    {"activeZoneMinutes": {"heartRateZone": "FAT_BURN",
+                            "activeZoneMinutes": "1", "interval": {...}}}
+    rather than the rollup's pre-summed-per-zone totals."""
+    payload = point.get("activeZoneMinutes")
+    if not isinstance(payload, dict):
+        return None
+    minutes = coerce_number(payload.get("activeZoneMinutes"))
+    if minutes is None:
+        return None
+    zone = payload.get("heartRateZone")
+    weight = _AZM_ZONE_WEIGHT.get(zone)
+    if weight is None:
+        _warn_unrecognised_azm_zone(zone)
+        return None
+    return minutes * weight
 
 
 @dataclass(frozen=True)
@@ -236,9 +328,17 @@ METRICS: dict[str, Metric] = {
         warmup_nights=0,
         max_range_days=90,
         supports_intraday=True,
-        extract=_scalar("steps", "countSum"),
-        # Rollup points carry civilStartTime at the top level.
-        date_of=_civil_date_at("civilStartTime", "date"),
+        # dailyRollUp gives steps.countSum with civilStartTime at the top
+        # level; the intraday `list` shape gives steps.count with the date
+        # nested under steps.interval.civilStartTime instead. Both are live.
+        extract=_first(
+            _scalar("steps", "countSum"),  # dailyRollUp shape
+            _scalar("steps", "count"),  # list (intraday) shape
+        ),
+        date_of=_first(
+            _civil_date_at("civilStartTime", "date"),  # dailyRollUp: top-level
+            _civil_date_at("steps", "interval", "civilStartTime", "date"),  # list
+        ),
     ),
     "active_zone_minutes": Metric(
         name="active_zone_minutes",
@@ -249,8 +349,15 @@ METRICS: dict[str, Metric] = {
         filter_dialect="physical",
         warmup_nights=0,
         max_range_days=90,
-        extract=_active_zone_minutes,
-        date_of=_civil_date_at("civilStartTime", "date"),
+        # dailyRollUp gives pre-summed-per-zone totals; the intraday `list`
+        # shape gives one per-minute record per zone instead. Both are live.
+        extract=_first(_active_zone_minutes, _active_zone_minutes_list),
+        date_of=_first(
+            _civil_date_at("civilStartTime", "date"),  # dailyRollUp: top-level
+            _civil_date_at(
+                "activeZoneMinutes", "interval", "civilStartTime", "date"
+            ),  # list
+        ),
     ),
     "heart_rate": Metric(
         name="heart_rate",
@@ -263,8 +370,18 @@ METRICS: dict[str, Metric] = {
         # The API caps heart-rate queries at 14 days, unlike the 90-day default.
         max_range_days=14,
         supports_intraday=True,
-        extract=_scalar("heartRate", "beatsPerMinute"),
-        date_of=_civil_date_at("heartRate", "sampleTime", "civilTime", "date"),
+        # dailyRollUp gives heartRate.beatsPerMinuteAvg with civilStartTime
+        # at the top level; the intraday `list` shape gives
+        # heartRate.beatsPerMinute with the date nested under
+        # heartRate.sampleTime.civilTime instead. Both are live.
+        extract=_first(
+            _scalar("heartRate", "beatsPerMinuteAvg"),  # dailyRollUp shape
+            _scalar("heartRate", "beatsPerMinute"),  # list shape
+        ),
+        date_of=_first(
+            _civil_date_at("civilStartTime", "date"),  # dailyRollUp: top-level
+            _civil_date_at("heartRate", "sampleTime", "civilTime", "date"),  # list
+        ),
     ),
 }
 

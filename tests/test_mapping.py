@@ -1,8 +1,10 @@
+import logging
 import math
 from datetime import date
 
 import pytest
 
+from mcp_fitbit_air import mapping as mapping_module
 from mcp_fitbit_air.mapping import (
     METRICS,
     SUMMARY_METRICS,
@@ -253,6 +255,212 @@ def test_sleep_date_uses_local_time_not_utc():
 def test_date_of_returns_none_for_unreadable_points():
     for name in SUMMARY_METRICS:
         assert get_metric(name).date_of({}) is None, name
+
+
+# --- Cross-shape defect: heart_rate, steps, and active_zone_minutes each
+# --- return a DIFFERENT payload shape depending on whether they were
+# --- fetched via dailyRollUp or via list. Points below are shaped exactly
+# --- like the live payloads captured against the real API (heart_rate from
+# --- the bug report; steps/active_zone_minutes from spike/raw2/
+# --- list_steps_nofilter.json and spike/raw2/list_azm_nofilter.json and
+# --- spike/raw2/rollup_steps__nested_date.json /
+# --- rollup_active-zone-minutes__nested_date.json).
+
+
+def test_heart_rate_extracts_both_rollup_and_list_shapes():
+    rollup_point = {
+        "civilStartTime": {"date": {"year": 2026, "month": 7, "day": 27}},
+        "civilEndTime": {"date": {"year": 2026, "month": 7, "day": 28}},
+        "heartRate": {
+            "beatsPerMinuteAvg": 72.74,
+            "beatsPerMinuteMax": 181,
+            "beatsPerMinuteMin": 48,
+        },
+    }
+    list_point = {
+        "heartRate": {
+            "sampleTime": {
+                "physicalTime": "2026-08-03T02:25:14Z",
+                "utcOffset": "-14400s",
+                "civilTime": {
+                    "date": {"year": 2026, "month": 8, "day": 2},
+                    "time": {"hours": 22, "minutes": 25, "seconds": 14},
+                },
+            },
+            "beatsPerMinute": "61",
+        }
+    }
+    metric = get_metric("heart_rate")
+
+    assert metric.extract(rollup_point) == pytest.approx(72.74)
+    assert metric.date_of(rollup_point) == date(2026, 7, 27)
+
+    assert metric.extract(list_point) == 61.0
+    assert metric.date_of(list_point) == date(2026, 8, 2)
+
+
+def test_steps_extracts_both_rollup_and_list_shapes():
+    rollup_point = {
+        "civilStartTime": {"date": {"year": 2026, "month": 8, "day": 1}, "time": {}},
+        "civilEndTime": {"date": {"year": 2026, "month": 8, "day": 2}, "time": {}},
+        "steps": {"countSum": "8630"},
+    }
+    list_point = {
+        "steps": {
+            "interval": {
+                "startTime": "2026-08-03T01:54:00Z",
+                "startUtcOffset": "-14400s",
+                "civilStartTime": {
+                    "date": {"year": 2026, "month": 8, "day": 2},
+                    "time": {"hours": 21, "minutes": 54},
+                },
+            },
+            "count": "12",
+        }
+    }
+    metric = get_metric("steps")
+
+    assert metric.extract(rollup_point) == 8630.0
+    assert metric.date_of(rollup_point) == date(2026, 8, 1)
+
+    assert metric.extract(list_point) == 12.0
+    assert metric.date_of(list_point) == date(2026, 8, 2)
+
+
+def test_active_zone_minutes_extracts_both_rollup_and_list_shapes():
+    rollup_point = {
+        "civilStartTime": {"date": {"year": 2026, "month": 8, "day": 1}, "time": {}},
+        "civilEndTime": {"date": {"year": 2026, "month": 8, "day": 2}, "time": {}},
+        "activeZoneMinutes": {
+            "sumInCardioHeartZone": "0",
+            "sumInPeakHeartZone": "0",
+            "sumInFatBurnHeartZone": "7",
+        },
+    }
+    fat_burn_point = {
+        "activeZoneMinutes": {
+            "interval": {
+                "startTime": "2026-08-02T05:27:00Z",
+                "civilStartTime": {
+                    "date": {"year": 2026, "month": 8, "day": 2},
+                    "time": {"hours": 1, "minutes": 27},
+                },
+            },
+            "heartRateZone": "FAT_BURN",
+            "activeZoneMinutes": "1",
+        }
+    }
+    cardio_point = {
+        "activeZoneMinutes": {
+            "interval": {
+                "civilStartTime": {"date": {"year": 2026, "month": 8, "day": 2}},
+            },
+            "heartRateZone": "CARDIO",
+            "activeZoneMinutes": "3",
+        }
+    }
+    peak_point = {
+        "activeZoneMinutes": {
+            "interval": {
+                "civilStartTime": {"date": {"year": 2026, "month": 8, "day": 2}},
+            },
+            "heartRateZone": "PEAK",
+            "activeZoneMinutes": "2",
+        }
+    }
+    metric = get_metric("active_zone_minutes")
+
+    # dailyRollUp shape: fat + 2*(cardio + peak) = 7 + 2*(0+0) = 7.
+    assert metric.extract(rollup_point) == 7.0
+    assert metric.date_of(rollup_point) == date(2026, 8, 1)
+
+    # list shape: each per-minute record is weighted by its own zone.
+    assert metric.extract(fat_burn_point) == 1.0
+    assert metric.date_of(fat_burn_point) == date(2026, 8, 2)
+    assert metric.extract(cardio_point) == 6.0  # 3 minutes * weight 2
+    assert metric.extract(peak_point) == 4.0  # 2 minutes * weight 2
+
+
+def test_active_zone_minutes_list_warns_once_for_an_unrecognised_zone(caplog):
+    """An unknown heartRateZone label must not be misweighted or crash the
+    process — it must be excluded from the total, loudly. Skipping without
+    a trace would be exactly the silent-failure bug this module exists to
+    close."""
+    mapping_module._AZM_WARNED_ZONES.clear()
+    point = {
+        "activeZoneMinutes": {
+            "interval": {"civilStartTime": {"date": {"year": 2026, "month": 8, "day": 2}}},
+            "heartRateZone": "CARDIO_ZONE",  # not one of the labels we weight
+            "activeZoneMinutes": "5",
+        }
+    }
+    with caplog.at_level(logging.WARNING, logger="mcp_fitbit_air.mapping"):
+        value = get_metric("active_zone_minutes").extract(point)
+
+    assert value is None
+    assert "CARDIO_ZONE" in caplog.text
+
+
+def test_active_zone_minutes_list_known_zones_emit_no_warning(caplog):
+    mapping_module._AZM_WARNED_ZONES.clear()
+    metric = get_metric("active_zone_minutes")
+    point = {
+        "activeZoneMinutes": {
+            "interval": {"civilStartTime": {"date": {"year": 2026, "month": 8, "day": 2}}},
+            "heartRateZone": "FAT_BURN",
+            "activeZoneMinutes": "1",
+        }
+    }
+    with caplog.at_level(logging.WARNING, logger="mcp_fitbit_air.mapping"):
+        value = metric.extract(point)
+
+    assert value == 1.0
+    assert caplog.records == []
+
+
+def test_active_zone_minutes_mix_of_known_and_unknown_zones_warns_once_not_per_point(
+    caplog,
+):
+    """Intraday AZM responses can carry hundreds of per-minute records. The
+    same unrecognised label recurring across many points must warn once,
+    not flood stderr once per point, while still excluding every one of
+    those points from the total and counting the known-zone points
+    correctly."""
+    mapping_module._AZM_WARNED_ZONES.clear()
+    metric = get_metric("active_zone_minutes")
+    fat_point = {
+        "activeZoneMinutes": {"heartRateZone": "FAT_BURN", "activeZoneMinutes": "1"}
+    }
+    unknown_point = {
+        "activeZoneMinutes": {"heartRateZone": "OUT_OF_RANGE", "activeZoneMinutes": "9"}
+    }
+
+    with caplog.at_level(logging.WARNING, logger="mcp_fitbit_air.mapping"):
+        fat_value = metric.extract(fat_point)
+        unknown_value_1 = metric.extract(unknown_point)
+        unknown_value_2 = metric.extract(unknown_point)
+
+    assert fat_value == 1.0
+    assert unknown_value_1 is None
+    assert unknown_value_2 is None
+    matching = [r for r in caplog.records if "OUT_OF_RANGE" in r.getMessage()]
+    assert len(matching) == 1, "expected exactly one warning for the repeated label"
+
+
+def test_rollup_shaped_point_resolves_a_date_for_every_dailyrollup_metric():
+    """This is the exact shape fetch_metric hands to `date_of` whenever
+    metric.method == "dailyRollUp" (see fetch.py: dailyRollUp points carry
+    civilStartTime at the top level). Every metric that declares this method
+    must resolve a date from it, regardless of which other shape(s) it also
+    has to tolerate (e.g. for intraday `list` queries)."""
+    rollup_point = {
+        "civilStartTime": {"date": {"year": 2026, "month": 8, "day": 5}},
+        "civilEndTime": {"date": {"year": 2026, "month": 8, "day": 6}},
+    }
+    rollup_metrics = [m for m in METRICS.values() if m.method == "dailyRollUp"]
+    assert rollup_metrics, "expected at least one dailyRollUp metric"
+    for metric in rollup_metrics:
+        assert metric.date_of(rollup_point) == date(2026, 8, 5), metric.name
 
 
 def test_extract_never_returns_a_non_finite_float():

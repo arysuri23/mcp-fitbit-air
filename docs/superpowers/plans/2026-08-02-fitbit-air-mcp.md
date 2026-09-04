@@ -18,6 +18,7 @@
 - **Token file is written at mode `0600`**, never committed, and `.gitignore`d.
 - **Config comes only from environment variables.** No client ID, secret, or project ID may be hardcoded in any source file.
 - **API base:** `https://health.googleapis.com/v4`
+- **Several data types return DIFFERENT payload shapes via `dailyRollUp` vs `list`,** and the wrong shape extracts `None`, surfacing as "no data" rather than an error. `heart-rate` is `heartRate.beatsPerMinuteAvg` (float) in a rollup and `heartRate.beatsPerMinute` (string) in a list; `steps` is `steps.countSum` vs `steps.count`; `active-zone-minutes` is per-zone sums vs per-minute records. Dates likewise sit at top-level `civilStartTime.date` in rollups but inside the payload for list points. Each metric's `extract` and `date_of` must therefore tolerate BOTH shapes. Verified live.
 - **Query range limits (API-imposed):** 14 days for `heart-rate`, `active-minutes`, `total-calories`, `calories-in-heart-rate-zone`; 90 days for all other data types.
 - **Tools are validated against an output schema the SDK derives from `inspect.signature`.** `functools.wraps` sets `wrapper.__wrapped__`, and `inspect.signature` follows `__wrapped__` unless the wrapper carries its own `__signature__` — so overwriting `__annotations__` alone does NOT work (this was tried and disproven against the installed SDK). `tool_guard` must set `wrapper.__signature__` to the wrapped function's signature with the return annotation replaced by `dict[str, Any]`, copying parameters through unchanged so later tools' input schemas survive. Otherwise the SDK validates each returned dict against a `ToolResult` schema requiring a `meta` key that `to_dict()` deliberately flattens away, and every call fails. **Unit tests that call a tool function directly cannot see this** — a tool test must go through `await mcp.call_tool(...)`.
 - **Never emit to stdout** anywhere in the server process — stdout is the MCP protocol stream. All diagnostics go to stderr via `logging`.
@@ -2823,6 +2824,7 @@ not mistaken for a settled 30-day one.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 BASELINE_WINDOW_DAYS = 30
@@ -2841,7 +2843,11 @@ class Baseline:
 def compute_baseline(
     values: list[float | None], window_days: int = BASELINE_WINDOW_DAYS
 ) -> Baseline:
-    present = [v for v in values if v is not None]
+    # Non-finite values are excluded alongside None. Upstream coerce_number
+    # already rejects them, but a single NaN reaching here would make the whole
+    # mean NaN — and baselines ride along in every summary row that goes onto
+    # the MCP stdio stream, where bare NaN is invalid JSON.
+    present = [v for v in values if v is not None and math.isfinite(v)]
     if not present:
         return Baseline(mean=None, n=0, window_days=window_days)
     return Baseline(
