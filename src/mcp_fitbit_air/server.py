@@ -175,9 +175,15 @@ def get_daily_summary(start_date: str, end_date: str | None = None) -> ToolResul
         }
     )
     if failures:
+        # When every metric failed for the same reason, that reason's fix is the
+        # answer — not something to be dug out of seven per-metric cells.
+        remedies = {
+            status["remedy"] for status in statuses.values() if status.get("remedy")
+        }
         return ToolResult.error(
             f"Could not fetch health data for {start.isoformat()} to "
             f"{end.isoformat()}: {'; '.join(failures)}",
+            remedy=remedies.pop() if len(remedies) == 1 else None,
             **summary,
         )
 
@@ -429,7 +435,9 @@ def get_metric_series(
         meta = {"truncated": True, "reason": series.truncation_reason}
 
     if series.state is ResultState.ERROR:
-        return ToolResult.error(series.message or "Failed to fetch metric.")
+        return ToolResult.error(
+            series.message or "Failed to fetch metric.", remedy=series.remedy
+        )
     if series.state is ResultState.WARMING_UP:
         return ToolResult.warming_up(
             series.message, warmup_nights=spec.warmup_nights, **meta

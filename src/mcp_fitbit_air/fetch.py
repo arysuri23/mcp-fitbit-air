@@ -38,6 +38,11 @@ class MetricSeries:
     # real but incomplete, which is worse than missing if nobody says so.
     truncated: bool = False
     truncation_reason: str | None = None
+    # ApiError carries the one line that says what to do about the failure. It
+    # has to travel with the series, because this function deliberately does not
+    # re-raise: build_summary fans out seven metrics and one failing must not
+    # blank out the six that worked.
+    remedy: str | None = None
 
 
 def point_date(metric: Metric, point: dict) -> date | None:
@@ -114,6 +119,7 @@ def fetch_metric(
     except ApiError as exc:
         series.state = ResultState.ERROR
         series.message = str(exc)
+        series.remedy = exc.remedy
         return series
 
     series.truncated = bool(getattr(points, "truncated", False))

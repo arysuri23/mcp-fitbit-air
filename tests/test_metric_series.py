@@ -998,3 +998,24 @@ def test_warming_up_also_carries_truncation(fake_context, monkeypatch):
 
     assert result["state"] == "warming_up"
     assert result["truncated"] is True
+
+
+def test_daily_error_carries_the_remedy(fake_context, monkeypatch):
+    """The daily path swallowed ApiError to build a MetricSeries, and lost the
+    remedy on the way. Intraday, which lets the error reach tool_guard, kept it -
+    so the same expired token gave different advice depending on granularity."""
+    from mcp_fitbit_air.server import get_metric_series
+
+    series = MetricSeries(
+        metric=get_metric("hrv"),
+        by_day={},
+        state=ResultState.ERROR,
+        message="The Health API rejected our credentials (401).",
+    )
+    series.remedy = "Run `mcp-fitbit-air auth` to re-authenticate."
+    stub_fetch(monkeypatch, series)
+
+    result = get_metric_series("hrv", "2026-08-01", "2026-08-02")
+
+    assert result["state"] == "error"
+    assert result["remedy"] == "Run `mcp-fitbit-air auth` to re-authenticate."

@@ -462,3 +462,60 @@ def test_summary_baseline_window_reports_its_trailing_days():
         result = build_summary(Mock(), date(2026, 8, 1), date(2026, 8, 2), ["steps"], TZ)
 
     assert result["baseline_window"]["trailing_days"] == BASELINE_LOOKBACK_DAYS
+
+
+def test_metric_status_error_cell_carries_the_remedy(fake_context):
+    from mcp_fitbit_air.client import ApiError
+
+    client = Mock()
+    client.list_data_points.side_effect = ApiError(
+        "rejected (401)", status=401, remedy="Run `mcp-fitbit-air auth` to re-authenticate."
+    )
+    client.daily_rollup.side_effect = client.list_data_points.side_effect
+
+    result = build_summary(client, date(2026, 8, 1), date(2026, 8, 2), ["hrv"], TZ)
+
+    assert result["metric_status"]["hrv"]["remedy"].startswith("Run `mcp-fitbit-air auth`")
+
+
+def test_a_total_failure_surfaces_the_shared_remedy(fake_context):
+    """When every metric failed for the same reason, that reason's fix is the
+    tool's answer - not something buried in seven per-metric cells."""
+    from mcp_fitbit_air.server import get_daily_summary
+
+    remedy = "Run `mcp-fitbit-air auth` to re-authenticate."
+    fake = {}
+    for name in _all_summary_names():
+        s = series(name, {}, state=ResultState.ERROR, message="rejected (401)")
+        s.remedy = remedy
+        fake[name] = s
+
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=fake_fetch(fake)):
+        result = get_daily_summary("2026-08-01", "2026-08-02")
+
+    assert result["state"] == "error"
+    assert result["remedy"] == remedy
+
+
+def test_conflicting_remedies_are_not_reduced_to_one(fake_context):
+    """Picking an arbitrary remedy when metrics failed for different reasons is
+    worse than offering none: it is confident advice that fixes only some of it.
+    The per-metric cells still carry each one."""
+    from mcp_fitbit_air.server import get_daily_summary
+
+    names = _all_summary_names()
+    fake = {}
+    for index, name in enumerate(names):
+        s = series(name, {}, state=ResultState.ERROR, message="failed")
+        s.remedy = "Run `mcp-fitbit-air auth`." if index % 2 else "Wait and retry."
+        fake[name] = s
+
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=fake_fetch(fake)):
+        result = get_daily_summary("2026-08-01", "2026-08-02")
+
+    assert result["state"] == "error"
+    assert "remedy" not in result
+    assert {c["remedy"] for c in result["metric_status"].values()} == {
+        "Run `mcp-fitbit-air auth`.",
+        "Wait and retry.",
+    }

@@ -297,3 +297,43 @@ def test_requested_days_defaults_to_the_fetched_window():
     series = fetch_metric(client, "hrv", date(2026, 1, 1), date(2026, 1, 3), TZ)
 
     assert series.state is ResultState.WARMING_UP
+
+
+# -- The remedy is the most actionable thing an error carries -----------------
+#
+# Found in review. fetch_metric kept ApiError's message and dropped its remedy,
+# so a 401 mid-session reported "the API rejected our credentials" without the
+# one line that says what to do about it - while the intraday path, which lets
+# ApiError reach tool_guard, reported it correctly. Same tool, same failure,
+# different answer.
+
+
+def test_fetch_metric_preserves_the_remedy_from_an_api_error():
+    from datetime import date
+
+    from mcp_fitbit_air.fetch import fetch_metric
+
+    client = Mock()
+    client.list_data_points.side_effect = ApiError(
+        "The Health API rejected our credentials (401): Invalid Credentials",
+        status=401,
+        remedy="Run `mcp-fitbit-air auth` to re-authenticate.",
+    )
+
+    series = fetch_metric(client, "hrv", date(2026, 8, 1), date(2026, 8, 2), TZ)
+
+    assert series.state is ResultState.ERROR
+    assert series.remedy == "Run `mcp-fitbit-air auth` to re-authenticate."
+
+
+def test_an_error_without_a_remedy_leaves_it_unset():
+    from datetime import date
+
+    from mcp_fitbit_air.fetch import fetch_metric
+
+    client = Mock()
+    client.list_data_points.side_effect = ApiError("Backend error", status=500)
+
+    series = fetch_metric(client, "hrv", date(2026, 8, 1), date(2026, 8, 2), TZ)
+
+    assert series.remedy is None

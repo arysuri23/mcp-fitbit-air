@@ -16,7 +16,6 @@ in the set.
 
 from __future__ import annotations
 
-import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from zoneinfo import ZoneInfo
@@ -24,8 +23,6 @@ from zoneinfo import ZoneInfo
 from .baselines import BASELINE_WINDOW_DAYS, compute_baseline, lookback_start
 from .fetch import MetricSeries, fetch_metric
 from .results import ResultState
-
-logger = logging.getLogger(__name__)
 
 MAX_SUMMARY_DAYS = 90
 BASELINE_LOOKBACK_DAYS = BASELINE_WINDOW_DAYS
@@ -136,6 +133,7 @@ def build_summary(
             "message": s.message,
             # Present only when it happened, so a clean row stays quiet.
             **({"truncated": True, "reason": s.truncation_reason} if s.truncated else {}),
+            **({"remedy": s.remedy} if s.remedy else {}),
         }
         for name, s in series_by_name.items()
     }
