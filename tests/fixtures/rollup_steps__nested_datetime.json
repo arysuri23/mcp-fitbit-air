@@ -1,0 +1,181 @@
+{
+  "body": {
+    "request": {
+      "range": {
+        "end": {
+          "date": {
+            "day": 7,
+            "month": 1,
+            "year": 2026
+          },
+          "time": {
+            "hours": 0
+          }
+        },
+        "start": {
+          "date": {
+            "day": 31,
+            "month": 12,
+            "year": 2025
+          },
+          "time": {
+            "hours": 0
+          }
+        }
+      },
+      "windowSizeDays": 1
+    },
+    "response": {
+      "rollupDataPoints": [
+        {
+          "civilEndTime": {
+            "date": {
+              "day": 7,
+              "month": 1,
+              "year": 2026
+            },
+            "time": {}
+          },
+          "civilStartTime": {
+            "date": {
+              "day": 6,
+              "month": 1,
+              "year": 2026
+            },
+            "time": {}
+          },
+          "steps": {
+            "countSum": "9000"
+          }
+        },
+        {
+          "civilEndTime": {
+            "date": {
+              "day": 6,
+              "month": 1,
+              "year": 2026
+            },
+            "time": {}
+          },
+          "civilStartTime": {
+            "date": {
+              "day": 5,
+              "month": 1,
+              "year": 2026
+            },
+            "time": {}
+          },
+          "steps": {
+            "countSum": "9000"
+          }
+        },
+        {
+          "civilEndTime": {
+            "date": {
+              "day": 5,
+              "month": 1,
+              "year": 2026
+            },
+            "time": {}
+          },
+          "civilStartTime": {
+            "date": {
+              "day": 4,
+              "month": 1,
+              "year": 2026
+            },
+            "time": {}
+          },
+          "steps": {
+            "countSum": "9000"
+          }
+        },
+        {
+          "civilEndTime": {
+            "date": {
+              "day": 4,
+              "month": 1,
+              "year": 2026
+            },
+            "time": {}
+          },
+          "civilStartTime": {
+            "date": {
+              "day": 3,
+              "month": 1,
+              "year": 2026
+            },
+            "time": {}
+          },
+          "steps": {
+            "countSum": "9000"
+          }
+        },
+        {
+          "civilEndTime": {
+            "date": {
+              "day": 3,
+              "month": 1,
+              "year": 2026
+            },
+            "time": {}
+          },
+          "civilStartTime": {
+            "date": {
+              "day": 2,
+              "month": 1,
+              "year": 2026
+            },
+            "time": {}
+          },
+          "steps": {
+            "countSum": "9000"
+          }
+        },
+        {
+          "civilEndTime": {
+            "date": {
+              "day": 2,
+              "month": 1,
+              "year": 2026
+            },
+            "time": {}
+          },
+          "civilStartTime": {
+            "date": {
+              "day": 1,
+              "month": 1,
+              "year": 2026
+            },
+            "time": {}
+          },
+          "steps": {
+            "countSum": "9000"
+          }
+        },
+        {
+          "civilEndTime": {
+            "date": {
+              "day": 1,
+              "month": 1,
+              "year": 2026
+            },
+            "time": {}
+          },
+          "civilStartTime": {
+            "date": {
+              "day": 31,
+              "month": 12,
+              "year": 2025
+            },
+            "time": {}
+          },
+          "steps": {
+            "countSum": "9000"
+          }
+        }
+      ]
+    }
+  },
+  "status": 200
+}

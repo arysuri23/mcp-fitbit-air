@@ -1,0 +1,97 @@
+{
+  "body": {
+    "dataPoints": [
+      {
+        "dailyRestingHeartRate": {
+          "beatsPerMinute": "60",
+          "dailyRestingHeartRateMetadata": {
+            "calculationMethod": "WITH_SLEEP"
+          },
+          "date": {
+            "day": 7,
+            "month": 1,
+            "year": 2026
+          }
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "DERIVED"
+        }
+      },
+      {
+        "dailyRestingHeartRate": {
+          "beatsPerMinute": "60",
+          "dailyRestingHeartRateMetadata": {
+            "calculationMethod": "WITH_SLEEP"
+          },
+          "date": {
+            "day": 6,
+            "month": 1,
+            "year": 2026
+          }
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "DERIVED"
+        }
+      },
+      {
+        "dailyRestingHeartRate": {
+          "beatsPerMinute": "60",
+          "dailyRestingHeartRateMetadata": {
+            "calculationMethod": "WITH_SLEEP"
+          },
+          "date": {
+            "day": 5,
+            "month": 1,
+            "year": 2026
+          }
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "DERIVED"
+        }
+      },
+      {
+        "dailyRestingHeartRate": {
+          "beatsPerMinute": "60",
+          "dailyRestingHeartRateMetadata": {
+            "calculationMethod": "WITH_SLEEP"
+          },
+          "date": {
+            "day": 4,
+            "month": 1,
+            "year": 2026
+          }
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "DERIVED"
+        }
+      },
+      {
+        "dailyRestingHeartRate": {
+          "beatsPerMinute": "60",
+          "dailyRestingHeartRateMetadata": {
+            "calculationMethod": "WITH_SLEEP"
+          },
+          "date": {
+            "day": 3,
+            "month": 1,
+            "year": 2026
+          }
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "DERIVED"
+        }
+      }
+    ]
+  },
+  "status": 200
+}

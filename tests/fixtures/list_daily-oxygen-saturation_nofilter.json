@@ -1,0 +1,92 @@
+{
+  "body": {
+    "dataPoints": [
+      {
+        "dailyOxygenSaturation": {
+          "averagePercentage": 96.0,
+          "date": {
+            "day": 7,
+            "month": 1,
+            "year": 2026
+          },
+          "lowerBoundPercentage": 94.0,
+          "upperBoundPercentage": 98.0
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "PASSIVELY_MEASURED"
+        }
+      },
+      {
+        "dailyOxygenSaturation": {
+          "averagePercentage": 96.0,
+          "date": {
+            "day": 6,
+            "month": 1,
+            "year": 2026
+          },
+          "lowerBoundPercentage": 94.0,
+          "upperBoundPercentage": 98.0
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "PASSIVELY_MEASURED"
+        }
+      },
+      {
+        "dailyOxygenSaturation": {
+          "averagePercentage": 96.0,
+          "date": {
+            "day": 5,
+            "month": 1,
+            "year": 2026
+          },
+          "lowerBoundPercentage": 94.0,
+          "upperBoundPercentage": 98.0
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "PASSIVELY_MEASURED"
+        }
+      },
+      {
+        "dailyOxygenSaturation": {
+          "averagePercentage": 96.0,
+          "date": {
+            "day": 4,
+            "month": 1,
+            "year": 2026
+          },
+          "lowerBoundPercentage": 94.0,
+          "upperBoundPercentage": 98.0
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "PASSIVELY_MEASURED"
+        }
+      },
+      {
+        "dailyOxygenSaturation": {
+          "averagePercentage": 96.0,
+          "date": {
+            "day": 3,
+            "month": 1,
+            "year": 2026
+          },
+          "lowerBoundPercentage": 94.0,
+          "upperBoundPercentage": 98.0
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "PASSIVELY_MEASURED"
+        }
+      }
+    ]
+  },
+  "status": 200
+}

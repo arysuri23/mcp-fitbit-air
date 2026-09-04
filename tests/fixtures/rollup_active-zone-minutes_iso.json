@@ -1,0 +1,34 @@
+{
+  "body": {
+    "request": {
+      "range": {
+        "endTime": "2026-01-07T00:00:00Z",
+        "startTime": "2025-12-31T00:00:00Z"
+      },
+      "windowSizeDays": 1
+    },
+    "response": {
+      "error": {
+        "code": 400,
+        "details": [
+          {
+            "@type": "type.googleapis.com/google.rpc.BadRequest",
+            "fieldViolations": [
+              {
+                "description": "Invalid JSON payload received. Unknown name \"startTime\" at 'range': Cannot find field.",
+                "field": "range"
+              },
+              {
+                "description": "Invalid JSON payload received. Unknown name \"endTime\" at 'range': Cannot find field.",
+                "field": "range"
+              }
+            ]
+          }
+        ],
+        "message": "Invalid JSON payload received. Unknown name \"startTime\" at 'range': Cannot find field.\nInvalid JSON payload received. Unknown name \"endTime\" at 'range': Cannot find field.",
+        "status": "INVALID_ARGUMENT"
+      }
+    }
+  },
+  "status": 400
+}

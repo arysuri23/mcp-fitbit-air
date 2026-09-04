@@ -1,0 +1,19 @@
+{
+  "body": {
+    "autoStrideEnabled": true,
+    "distanceUnit": "DISTANCE_UNIT_MILES",
+    "foodLanguageCode": "en-US",
+    "glucoseUnit": "GLUCOSE_UNIT_MG_DL",
+    "heightUnit": "HEIGHT_UNIT_INCHES",
+    "languageLocale": "en-US",
+    "name": "redacted-name",
+    "strideLengthRunningType": "STRIDE_LENGTH_TYPE_DEFAULT",
+    "strideLengthWalkingType": "STRIDE_LENGTH_TYPE_DEFAULT",
+    "temperatureUnit": "TEMPERATURE_UNIT_FAHRENHEIT",
+    "timeZone": "America/New_York",
+    "utcOffset": "-14400s",
+    "waterUnit": "WATER_UNIT_FL_OZ",
+    "weightUnit": "WEIGHT_UNIT_POUNDS"
+  },
+  "status": 200
+}

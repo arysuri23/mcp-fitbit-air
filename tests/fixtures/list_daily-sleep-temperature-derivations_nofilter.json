@@ -1,0 +1,92 @@
+{
+  "body": {
+    "dataPoints": [
+      {
+        "dailySleepTemperatureDerivations": {
+          "baselineTemperatureCelsius": 33.8,
+          "date": {
+            "day": 7,
+            "month": 1,
+            "year": 2026
+          },
+          "nightlyTemperatureCelsius": 34.0,
+          "relativeNightlyStddev30dCelsius": 0.4
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "DERIVED"
+        }
+      },
+      {
+        "dailySleepTemperatureDerivations": {
+          "baselineTemperatureCelsius": 33.8,
+          "date": {
+            "day": 6,
+            "month": 1,
+            "year": 2026
+          },
+          "nightlyTemperatureCelsius": 34.0,
+          "relativeNightlyStddev30dCelsius": 0.4
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "DERIVED"
+        }
+      },
+      {
+        "dailySleepTemperatureDerivations": {
+          "baselineTemperatureCelsius": 33.8,
+          "date": {
+            "day": 5,
+            "month": 1,
+            "year": 2026
+          },
+          "nightlyTemperatureCelsius": 34.0,
+          "relativeNightlyStddev30dCelsius": 0.4
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "DERIVED"
+        }
+      },
+      {
+        "dailySleepTemperatureDerivations": {
+          "baselineTemperatureCelsius": "NaN",
+          "date": {
+            "day": 4,
+            "month": 1,
+            "year": 2026
+          },
+          "nightlyTemperatureCelsius": 34.0,
+          "relativeNightlyStddev30dCelsius": "NaN"
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "DERIVED"
+        }
+      },
+      {
+        "dailySleepTemperatureDerivations": {
+          "baselineTemperatureCelsius": "NaN",
+          "date": {
+            "day": 3,
+            "month": 1,
+            "year": 2026
+          },
+          "nightlyTemperatureCelsius": 34.0,
+          "relativeNightlyStddev30dCelsius": "NaN"
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "DERIVED"
+        }
+      }
+    ]
+  },
+  "status": 200
+}

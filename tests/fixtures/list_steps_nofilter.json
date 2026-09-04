@@ -1,0 +1,46 @@
+{
+  "body": {
+    "dataPoints": [
+      {
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "PASSIVELY_MEASURED"
+        },
+        "steps": {
+          "count": "100",
+          "interval": {
+            "civilEndTime": {
+              "date": {
+                "day": 7,
+                "month": 1,
+                "year": 2026
+              },
+              "time": {
+                "hours": 21,
+                "minutes": 30
+              }
+            },
+            "civilStartTime": {
+              "date": {
+                "day": 7,
+                "month": 1,
+                "year": 2026
+              },
+              "time": {
+                "hours": 21,
+                "minutes": 30
+              }
+            },
+            "endTime": "2026-01-08T01:55:00Z",
+            "endUtcOffset": "-14400s",
+            "startTime": "2026-01-08T01:54:00Z",
+            "startUtcOffset": "-14400s"
+          }
+        }
+      }
+    ],
+    "nextPageToken": "redacted-nextPageToken"
+  },
+  "status": 200
+}

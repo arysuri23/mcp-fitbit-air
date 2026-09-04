@@ -1,0 +1,33 @@
+{
+  "body": {
+    "error": {
+      "code": 400,
+      "details": [
+        {
+          "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+          "domain": "health.googleapis.com",
+          "metadata": {
+            "detailedReasons": "INVALID_DATA_POINT_FILTER_DATA_TYPE_MEMBER,INVALID_DATA_POINT_FILTER_DATA_TYPE_MEMBER"
+          },
+          "reason": "INVALID_DATA_POINT_FILTER"
+        },
+        {
+          "@type": "type.googleapis.com/google.rpc.BadRequest",
+          "fieldViolations": [
+            {
+              "description": "Member 'daily_heart_rate_variability.civil_date' is not supported for filtering. (at line 1, column 1)",
+              "field": "filter"
+            },
+            {
+              "description": "Member 'daily_heart_rate_variability.civil_date' is not supported for filtering. (at line 1, column 61)",
+              "field": "filter"
+            }
+          ]
+        }
+      ],
+      "message": "Invalid data point filter: INVALID_DATA_POINT_FILTER_DATA_TYPE_MEMBER, INVALID_DATA_POINT_FILTER_DATA_TYPE_MEMBER.",
+      "status": "INVALID_ARGUMENT"
+    }
+  },
+  "status": 400
+}

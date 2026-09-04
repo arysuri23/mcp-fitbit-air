@@ -1,0 +1,79 @@
+{
+  "body": {
+    "dataPoints": [
+      {
+        "dailyHeartRateVariability": {
+          "averageHeartRateVariabilityMilliseconds": 45.0,
+          "date": {
+            "day": 6,
+            "month": 1,
+            "year": 2026
+          },
+          "deepSleepRootMeanSquareOfSuccessiveDifferencesMilliseconds": 40.0,
+          "entropy": 1.5,
+          "nonRemHeartRateBeatsPerMinute": "59"
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "DERIVED"
+        }
+      },
+      {
+        "dailyHeartRateVariability": {
+          "averageHeartRateVariabilityMilliseconds": 45.0,
+          "date": {
+            "day": 5,
+            "month": 1,
+            "year": 2026
+          },
+          "deepSleepRootMeanSquareOfSuccessiveDifferencesMilliseconds": 40.0,
+          "entropy": 1.5,
+          "nonRemHeartRateBeatsPerMinute": "59"
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "DERIVED"
+        }
+      },
+      {
+        "dailyHeartRateVariability": {
+          "averageHeartRateVariabilityMilliseconds": 45.0,
+          "date": {
+            "day": 4,
+            "month": 1,
+            "year": 2026
+          },
+          "deepSleepRootMeanSquareOfSuccessiveDifferencesMilliseconds": 40.0,
+          "entropy": 1.5,
+          "nonRemHeartRateBeatsPerMinute": "59"
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "DERIVED"
+        }
+      },
+      {
+        "dailyHeartRateVariability": {
+          "averageHeartRateVariabilityMilliseconds": 45.0,
+          "date": {
+            "day": 3,
+            "month": 1,
+            "year": 2026
+          },
+          "deepSleepRootMeanSquareOfSuccessiveDifferencesMilliseconds": 40.0,
+          "entropy": 1.5,
+          "nonRemHeartRateBeatsPerMinute": "59"
+        },
+        "dataSource": {
+          "device": {},
+          "platform": "FITBIT",
+          "recordingMethod": "DERIVED"
+        }
+      }
+    ]
+  },
+  "status": 200
+}
