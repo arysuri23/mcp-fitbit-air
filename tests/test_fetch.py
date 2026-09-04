@@ -184,3 +184,55 @@ def test_physical_filter_uses_rfc3339_utc_instants():
 def test_physical_filter_respects_a_different_timezone():
     expr = build_filter(get_metric("heart_rate"), START, START, ZoneInfo("UTC"))
     assert '"2026-08-01T00:00:00Z"' in expr
+
+
+# -- Pagination truncation reaches the tools ---------------------------------
+#
+# fetch_metric is the only path from the client's DataPoints to a MetricSeries.
+# If it drops the truncation flag here, every layer above it reports a partial
+# series as complete no matter how carefully they handle the flag they never
+# receive.
+
+
+def test_fetch_metric_propagates_truncation_from_the_client():
+    from mcp_fitbit_air.client import DataPoints
+
+    client = Mock()
+    client.daily_rollup.return_value = DataPoints(
+        [],
+        truncated=True,
+        truncation_reason="Reached the 50-page fetch limit.",
+    )
+
+    series = fetch_metric(client, "steps", date(2026, 8, 1), date(2026, 8, 2), ZoneInfo("UTC"))
+
+    assert series.truncated is True
+    assert "50-page" in series.truncation_reason
+
+
+def test_fetch_metric_propagates_truncation_from_a_list_call():
+    """The list path and the rollup path are separate calls in fetch_metric;
+    covering only one would leave the other free to drop the flag."""
+    from mcp_fitbit_air.client import DataPoints
+
+    client = Mock()
+    client.list_data_points.return_value = DataPoints(
+        [], truncated=True, truncation_reason="Reached the 50-page fetch limit."
+    )
+
+    series = fetch_metric(client, "hrv", date(2026, 8, 1), date(2026, 8, 2), ZoneInfo("UTC"))
+
+    assert series.truncated is True
+    assert "50-page" in series.truncation_reason
+
+
+def test_fetch_metric_reports_a_complete_fetch_as_untruncated():
+    from mcp_fitbit_air.client import DataPoints
+
+    client = Mock()
+    client.daily_rollup.return_value = DataPoints([])
+
+    series = fetch_metric(client, "steps", date(2026, 8, 1), date(2026, 8, 2), ZoneInfo("UTC"))
+
+    assert series.truncated is False
+    assert series.truncation_reason is None

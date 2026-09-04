@@ -34,6 +34,10 @@ class MetricSeries:
     by_day: dict[date, float] = field(default_factory=dict)
     state: ResultState = ResultState.OK
     message: str | None = None
+    # Set when pagination stopped before the end of the range. The data here is
+    # real but incomplete, which is worse than missing if nobody says so.
+    truncated: bool = False
+    truncation_reason: str | None = None
 
 
 def point_date(metric: Metric, point: dict) -> date | None:
@@ -99,6 +103,9 @@ def fetch_metric(
         series.state = ResultState.ERROR
         series.message = str(exc)
         return series
+
+    series.truncated = bool(getattr(points, "truncated", False))
+    series.truncation_reason = getattr(points, "truncation_reason", None)
 
     _accumulate(series, points)
 

@@ -31,6 +31,13 @@ RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 # forever — and since this client is the single seam every tool call goes
 # through, that hangs the whole MCP server. Truncated data beats a hung server.
 MAX_PAGES = 50
+# One day of `heart-rate` is ~38,000 points, so page size decides both latency
+# and how much of a range survives MAX_PAGES. Measured against the live API on
+# the same day's data: 1,440/page took 9.4s, 5,000/page took 3.5s, and 10,000
+# was no better than 5,000. The larger page also lifts the truncation ceiling
+# from 72,000 records to 250,000, which is the difference between a week of
+# intraday heart rate arriving whole or arriving cut.
+DEFAULT_PAGE_SIZE = 5000
 
 AUTH_REMEDY = "Run `mcp-fitbit-air auth` to re-authenticate."
 
@@ -46,6 +53,33 @@ class ApiError(Exception):
 
 class RateLimitError(ApiError):
     """Raised when the API keeps returning 429 after the retry budget."""
+
+
+class DataPoints(list):
+    """Data points, plus whether the fetch actually reached the end.
+
+    Pagination stops early in two bounded-but-incomplete cases: the page cap
+    and a repeated-token cycle. Both were logged to stderr and nowhere else,
+    which means a caller — ultimately Claude — could not tell a partial series
+    from a whole one and would state conclusions about incomplete data as fact.
+    This is not hypothetical: one day of `heart-rate` is ~38,000 points at a
+    1,440 page size, so anything past a single day hits the cap.
+
+    Subclassing `list` keeps every existing call site and every isinstance
+    check working while carrying that one extra bit. The flag is per-result
+    rather than per-client on purpose: summary.py fans metrics out across a
+    thread pool, so client-level state would race.
+    """
+
+    def __init__(
+        self,
+        items: Any = (),
+        truncated: bool = False,
+        truncation_reason: str | None = None,
+    ) -> None:
+        super().__init__(items)
+        self.truncated = truncated
+        self.truncation_reason = truncation_reason
 
 
 class HealthClient:
@@ -126,7 +160,7 @@ class HealthClient:
         items_key: str,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> DataPoints:
         """Follow `nextPageToken` to completion, guarding against the two ways
         a pagination loop can hang forever: a server that repeats the same
         token (cycle) and a server that keeps minting fresh tokens
@@ -153,16 +187,14 @@ class HealthClient:
 
             next_token = payload.get("nextPageToken")
             if not next_token:
-                return collected
+                return DataPoints(collected)
             if next_token == token:
-                logger.warning(
-                    "Pagination cycle detected for %s (repeated nextPageToken); "
-                    "stopping after %d page(s) with %d item(s) collected.",
-                    url,
-                    page + 1,
-                    len(collected),
+                reason = (
+                    f"The API repeated the same page token after {page + 1} page(s); "
+                    f"stopped with {len(collected)} record(s), which may be incomplete."
                 )
-                return collected
+                logger.warning("Pagination cycle detected for %s. %s", url, reason)
+                return DataPoints(collected, truncated=True, truncation_reason=reason)
 
             token = next_token
             if params is not None:
@@ -170,14 +202,13 @@ class HealthClient:
             if json_body is not None:
                 json_body = dict(json_body, pageToken=token)
 
-        logger.warning(
-            "Hit MAX_PAGES=%d while paginating %s; returning %d item(s) "
-            "collected so far (data may be truncated).",
-            MAX_PAGES,
-            url,
-            len(collected),
+        reason = (
+            f"Reached the {MAX_PAGES}-page fetch limit with {len(collected)} record(s); "
+            "the range holds more data than one request can return. Ask for a "
+            "shorter range to see all of it."
         )
-        return collected
+        logger.warning("Hit MAX_PAGES while paginating %s. %s", url, reason)
+        return DataPoints(collected, truncated=True, truncation_reason=reason)
 
     # -- public API --------------------------------------------------------
 
@@ -202,8 +233,8 @@ class HealthClient:
         self,
         data_type: str,
         filter_expr: str | None = None,
-        page_size: int = 1440,
-    ) -> list[dict[str, Any]]:
+        page_size: int = DEFAULT_PAGE_SIZE,
+    ) -> DataPoints:
         """List data points, following pagination to completion."""
         url = f"{BASE_URL}/users/me/dataTypes/{data_type}/dataPoints"
         params: dict[str, Any] = {"pageSize": page_size}
@@ -218,7 +249,7 @@ class HealthClient:
         start: date,
         end: date,
         window_size_days: int = 1,
-    ) -> list[dict[str, Any]]:
+    ) -> DataPoints:
         """Roll data up into per-day buckets. `end` is inclusive here; the API
         range is closed-open, so we send end + 1 day.
 

@@ -3379,7 +3379,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from zoneinfo import ZoneInfo
 
-from .baselines import compute_baseline
+from .baselines import BASELINE_WINDOW_DAYS, compute_baseline
 from .fetch import MetricSeries, fetch_metric
 from .mapping import get_metric
 from .results import ResultState
@@ -3387,15 +3387,37 @@ from .results import ResultState
 logger = logging.getLogger(__name__)
 
 MAX_SUMMARY_DAYS = 90
+BASELINE_LOOKBACK_DAYS = BASELINE_WINDOW_DAYS
 
 
 def _days_in(start: date, end: date) -> list[date]:
     return [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
 
 
+def _fetch_start(start: date, end: date, metric_names: list[str]) -> date:
+    """How far back to reach for baseline history.
+
+    Every metric has its own per-request range cap, and the whole set is fetched
+    over one shared window, so the budget is the narrowest cap in the set. What
+    is left after the requested range is what the lookback may use.
+    """
+    span = (end - start).days + 1
+    budget = min(
+        (get_metric(name).max_range_days for name in metric_names),
+        default=MAX_SUMMARY_DAYS,
+    )
+    lookback = max(0, min(BASELINE_LOOKBACK_DAYS, budget - span))
+    return start - timedelta(days=lookback)
+
+
 def build_summary(
     client, start: date, end: date, metric_names: list[str], tz: ZoneInfo
 ) -> dict:
+    if end < start:
+        raise ValueError(
+            f"End date {end.isoformat()} is before start date {start.isoformat()}."
+        )
+
     span = (end - start).days + 1
     if span > MAX_SUMMARY_DAYS:
         raise ValueError(
@@ -3404,14 +3426,22 @@ def build_summary(
             "single metric."
         )
 
+    fetch_start = _fetch_start(start, end, metric_names)
+    window_days = (end - fetch_start).days + 1
+
     with ThreadPoolExecutor(max_workers=len(metric_names) or 1) as pool:
         series_list: list[MetricSeries] = list(
-            pool.map(lambda name: fetch_metric(client, name, start, end, tz), metric_names)
+            pool.map(
+                lambda name: fetch_metric(client, name, fetch_start, end, tz),
+                metric_names,
+            )
         )
     series_by_name = {s.metric.name: s for s in series_list}
 
+    # Computed over the widened window, including the lookback days that are
+    # never emitted as rows.
     baselines = {
-        name: compute_baseline(list(s.by_day.values()))
+        name: compute_baseline(list(s.by_day.values()), window_days=window_days)
         for name, s in series_by_name.items()
     }
 
@@ -3455,6 +3485,11 @@ def build_summary(
 
     return {
         "range": {"start": start.isoformat(), "end": end.isoformat()},
+        "baseline_window": {
+            "start": fetch_start.isoformat(),
+            "end": end.isoformat(),
+            "days": window_days,
+        },
         "days": days,
         "metric_status": metric_status,
     }
@@ -3486,7 +3521,8 @@ def get_daily_summary(start_date: str, end_date: str | None = None) -> ToolResul
     "2026-07-28". Give a whole-range expression as start_date on its own
     ("last week"), or a start and end pair. Maximum range is 90 days.
 
-    Every value carries its unit and a trailing 30-day baseline with the sample
+    Every value carries its unit and a trailing baseline computed over a window
+    reaching up to 30 days before the requested range, reported alongside the sample
     size it was computed from — a baseline with a small n should not be read as
     a settled norm. Days with no data are marked no_data rather than zero, and
     metrics Fitbit has not computed yet are marked warming_up.
@@ -3612,8 +3648,16 @@ def test_intraday_on_unsupported_metric_is_an_error(fake_context):
 def test_intraday_range_is_truncated_to_seven_days(fake_context):
     from mcp_fitbit_air import server
 
+    # Real shape, from tests/fixtures/list_heart_rate_nofilter.json. An invented
+    # shape (e.g. heartRate.bpm) extracts nothing, so every reading assertion
+    # would pass vacuously against zero readings.
     fake_context.client.list_data_points.return_value = [
-        {"heartRate": {"bpm": 62}, "interval": {"startTime": "2026-08-01T09:00:00Z"}}
+        {
+            "heartRate": {
+                "beatsPerMinute": "62",
+                "sampleTime": {"physicalTime": "2026-08-01T09:00:00Z"},
+            }
+        }
     ]
 
     result = server.get_metric_series(
@@ -3668,7 +3712,7 @@ Add to the existing imports in `src/mcp_fitbit_air/server.py`:
 import datetime as dt
 from datetime import timedelta
 
-from .baselines import compute_baseline
+from .baselines import compute_baseline, lookback_start
 from .fetch import build_filter, fetch_metric
 from .mapping import METRICS, get_metric
 from .results import ResultState
@@ -3712,6 +3756,10 @@ def _intraday_series(ctx, metric, start: dt.date, end: dt.date, truncated: bool)
         if value is None:
             continue
         readings.append({"time": _reading_time(point), "value": value})
+
+    # The API makes no ordering promise, and an out-of-order series reads as
+    # noise. Readings with no resolvable time sort last rather than first.
+    readings.sort(key=lambda r: (r["time"] is None, r["time"] or ""))
 
     meta = {}
     if truncated:
@@ -3761,15 +3809,18 @@ def get_metric_series(
     so when it truncates.
 
     Dates accept natural language, as in get_daily_summary. Daily results carry
-    a trailing 30-day baseline with its sample size.
+    a trailing baseline drawn from up to 30 days before the requested range,
+    reported with the sample size and the window it actually used.
     """
+    # Checked before get_context() so a typo fails on its own terms rather than
+    # as an authentication error.
     if granularity not in {"daily", "intraday"}:
         return ToolResult.error(
             f"Unknown granularity {granularity!r}. Use \"daily\" or \"intraday\"."
         )
 
-    ctx = get_context()
     spec = get_metric(metric)  # raises UnknownMetricError, handled by tool_guard
+    ctx = get_context()
     start, end = resolve_range(start_date, end_date, ctx.timezone)
 
     if granularity == "intraday":
@@ -3791,7 +3842,12 @@ def get_metric_series(
             f"for {metric}. Request a narrower range."
         )
 
-    series = fetch_metric(ctx.client, metric, start, end, ctx.timezone)
+    # Reach back past `start` so the baseline is trailing rather than a mean of
+    # the same days being asked about. Those extra days inform the baseline and
+    # are then dropped from `points`. lookback_start respects this metric's own
+    # max_range_days, so heart_rate gets 14 days rather than 30.
+    fetch_start = lookback_start(start, end, [metric])
+    series = fetch_metric(ctx.client, metric, fetch_start, end, ctx.timezone)
 
     if series.state is ResultState.ERROR:
         return ToolResult.error(series.message or "Failed to fetch metric.")
@@ -3800,10 +3856,13 @@ def get_metric_series(
     if series.state is ResultState.NO_DATA:
         return ToolResult.no_data(series.message)
 
-    baseline = compute_baseline(list(series.by_day.values()))
+    baseline = compute_baseline(
+        list(series.by_day.values()), window_days=(end - fetch_start).days + 1
+    )
     points = [
         {"date": day.isoformat(), "value": value}
         for day, value in sorted(series.by_day.items())
+        if start <= day <= end
     ]
 
     return ToolResult.ok(
@@ -3812,6 +3871,11 @@ def get_metric_series(
             "unit": spec.unit,
             "granularity": "daily",
             "range": {"start": start.isoformat(), "end": end.isoformat()},
+            "baseline_window": {
+                "start": fetch_start.isoformat(),
+                "end": end.isoformat(),
+                "days": (end - fetch_start).days + 1,
+            },
             "baseline": baseline.to_dict(),
             "points": points,
         }

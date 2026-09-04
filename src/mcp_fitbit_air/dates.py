@@ -96,7 +96,13 @@ def resolve_range(
         return relative
 
     start_date = resolve_day(start, tz, today)
-    end_date = resolve_day(end, tz, today) if end is not None else now
+    # A bare single-day start means that one day. Defaulting the end to `now`
+    # instead made "yesterday" resolve to a two-day range ending on today's
+    # partial data — the opposite of what the caller asked for, and enough to
+    # push an intraday request past the API's page limit. "Through today" is
+    # still expressible as an explicit end_date, and whole-range expressions
+    # ("last week") never reach this branch.
+    end_date = resolve_day(end, tz, today) if end is not None else start_date
 
     if end_date < start_date:
         raise DateParseError(

@@ -514,3 +514,78 @@ def test_an_empty_paired_devices_list_is_an_answer_not_a_fallback(monkeypatch):
     )
 
     assert client.get_paired_devices() == []
+# -- Pagination truncation is reported, not just logged ----------------------
+#
+# The page cap and the cycle guard both stop early with real but incomplete
+# data. Logging that to stderr is not enough: the tools - and ultimately Claude
+# - need to know the series has a hole in it. Verified live that this is
+# reachable in normal use, not just in theory: two days of heart_rate is ~76,000
+# points at a 1,440 page size, so it stops at 50 pages every time.
+
+
+@responses.activate
+def test_complete_fetch_is_not_flagged_as_truncated(client):
+    responses.add(
+        responses.GET,
+        f"{BASE}/users/me/dataTypes/steps/dataPoints",
+        json={"dataPoints": [{"id": 1}]},
+        status=200,
+    )
+
+    points = client.list_data_points("steps")
+
+    assert points.truncated is False
+    assert points.truncation_reason is None
+
+
+@responses.activate
+def test_max_pages_truncation_is_reported_on_the_result(client):
+    for i in range(MAX_PAGES):
+        responses.add(
+            responses.GET,
+            f"{BASE}/users/me/dataTypes/steps/dataPoints",
+            json={"dataPoints": [{"id": i}], "nextPageToken": f"page-{i}"},
+            status=200,
+        )
+
+    points = client.list_data_points("steps")
+
+    assert points.truncated is True
+    assert str(MAX_PAGES) in points.truncation_reason
+    assert len(points) == MAX_PAGES
+
+
+@responses.activate
+def test_pagination_cycle_truncation_is_reported_on_the_result(client):
+    responses.add(
+        responses.GET,
+        f"{BASE}/users/me/dataTypes/steps/dataPoints",
+        json={"dataPoints": [{"id": 1}], "nextPageToken": "cycle"},
+        status=200,
+    )
+    responses.add(
+        responses.GET,
+        f"{BASE}/users/me/dataTypes/steps/dataPoints",
+        json={"dataPoints": [{"id": 2}], "nextPageToken": "cycle"},
+        status=200,
+    )
+
+    points = client.list_data_points("steps")
+
+    assert points.truncated is True
+    assert "token" in points.truncation_reason.lower()
+
+
+@responses.activate
+def test_daily_rollup_also_reports_truncation(client):
+    for i in range(MAX_PAGES):
+        responses.add(
+            responses.POST,
+            f"{BASE}/users/me/dataTypes/steps/dataPoints:dailyRollUp",
+            json={"rollupDataPoints": [{"id": i}], "nextPageToken": f"page-{i}"},
+            status=200,
+        )
+
+    points = client.daily_rollup("steps", date(2026, 8, 1), date(2026, 8, 2))
+
+    assert points.truncated is True
