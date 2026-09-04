@@ -12,8 +12,8 @@ build/
 
 # Never commit credentials or raw health data
 token.json
+# The spike's captured responses are UNSCRUBBED: real account id, real
+# readings. Only the scrubbed copies under tests/fixtures/ may be committed.
+spike/
 client_secret*.json
-spike/raw/
 .env
-spike/raw2/
-spike/token.json

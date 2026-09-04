@@ -196,7 +196,10 @@ as a post-change check that the API still behaves as the fixtures claim.
 
 ## Design
 
-See [`docs/superpowers/specs/2026-08-02-fitbit-air-mcp-design.md`](docs/superpowers/specs/2026-08-02-fitbit-air-mcp-design.md).
+See [`docs/design.md`](docs/design.md) for the design rationale, and
+[`docs/phase0-findings.md`](docs/phase0-findings.md) for the verified API
+contract — filter dialects, payload shapes, and the failure modes that
+return HTTP 200 with zero rows instead of an error.
 
 ## Limitations
 

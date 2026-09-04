@@ -1,7 +1,7 @@
 """Metric registry: friendly name -> Google Health API specifics.
 
 Single source of truth. Every value here was verified against the live API by
-the Phase 0 spike; see docs/superpowers/plans/phase0-findings.md.
+the Phase 0 spike; see docs/phase0-findings.md.
 
 Three things about this API make a naive mapping wrong:
 
