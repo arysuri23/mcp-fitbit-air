@@ -421,12 +421,21 @@ def get_metric_series(
         ctx.client, metric, fetch_start, end, ctx.timezone, requested_days=span
     )
 
+    # Built before any return: a fetch that stopped early has to say so on every
+    # path out of here, not just the successful one. "No data in this range" and
+    # "we stopped looking before we got there" are different answers.
+    meta: dict[str, Any] = {}
+    if series.truncated:
+        meta = {"truncated": True, "reason": series.truncation_reason}
+
     if series.state is ResultState.ERROR:
         return ToolResult.error(series.message or "Failed to fetch metric.")
     if series.state is ResultState.WARMING_UP:
-        return ToolResult.warming_up(series.message, warmup_nights=spec.warmup_nights)
+        return ToolResult.warming_up(
+            series.message, warmup_nights=spec.warmup_nights, **meta
+        )
     if series.state is ResultState.NO_DATA:
-        return ToolResult.no_data(series.message)
+        return ToolResult.no_data(series.message, **meta)
 
     baseline = compute_baseline(
         list(series.by_day.values()), window_days=(end - fetch_start).days + 1
@@ -442,12 +451,9 @@ def get_metric_series(
         # Claude a baseline and nothing to say about it.
         return ToolResult.no_data(
             f"No {metric} recorded between {start.isoformat()} and "
-            f"{end.isoformat()}, though there are values before that range."
+            f"{end.isoformat()}, though there are values before that range.",
+            **meta,
         )
-
-    meta: dict[str, Any] = {}
-    if series.truncated:
-        meta = {"truncated": True, "reason": series.truncation_reason}
 
     return ToolResult.ok(
         {

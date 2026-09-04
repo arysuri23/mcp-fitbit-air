@@ -929,3 +929,72 @@ def test_metric_series_reports_warming_up_through_its_widened_window(fake_contex
     result = get_metric_series("hrv", "2026-08-01", "2026-08-03")
 
     assert result["state"] == "warming_up"
+
+
+# -- Truncation must survive every exit from the daily path -------------------
+#
+# Found by cloud review of the empty-range guard. The meta block was assembled
+# below the early returns, so a fetch that was cut short reported its result
+# authoritatively with no signal that it had been cut short - the exact collapse
+# DataPoints.truncated was added to prevent.
+
+
+def test_empty_range_no_data_still_reports_a_truncated_fetch(fake_context, monkeypatch):
+    from mcp_fitbit_air.server import get_metric_series
+
+    series = MetricSeries(
+        metric=get_metric("hrv"),
+        by_day={date(2026, 6, 15): 55.0},   # lookback only
+        truncated=True,
+        truncation_reason="The API repeated the same page token.",
+    )
+    stub_fetch(monkeypatch, series)
+
+    result = get_metric_series("hrv", "2026-07-01", "2026-07-05")
+
+    assert result["state"] == "no_data"
+    assert result["truncated"] is True
+    assert "page token" in result["reason"]
+
+
+def test_a_wholly_empty_truncated_fetch_also_reports_truncation(
+    fake_context, monkeypatch
+):
+    """The likelier trigger: the fetch is cut short before it reaches the range
+    at all, so the series is empty and no_data - which reads as "you have no
+    data" rather than "we stopped looking"."""
+    from mcp_fitbit_air.server import get_metric_series
+
+    series = MetricSeries(
+        metric=get_metric("hrv"),
+        by_day={},
+        state=ResultState.NO_DATA,
+        message="No hrv recorded.",
+        truncated=True,
+        truncation_reason="Reached the 50-page fetch limit.",
+    )
+    stub_fetch(monkeypatch, series)
+
+    result = get_metric_series("hrv", "2026-07-01", "2026-07-05")
+
+    assert result["state"] == "no_data"
+    assert result["truncated"] is True
+
+
+def test_warming_up_also_carries_truncation(fake_context, monkeypatch):
+    from mcp_fitbit_air.server import get_metric_series
+
+    series = MetricSeries(
+        metric=get_metric("hrv"),
+        by_day={},
+        state=ResultState.WARMING_UP,
+        message="hrv needs about 3 nights.",
+        truncated=True,
+        truncation_reason="Reached the 50-page fetch limit.",
+    )
+    stub_fetch(monkeypatch, series)
+
+    result = get_metric_series("hrv", "2026-07-01", "2026-07-03")
+
+    assert result["state"] == "warming_up"
+    assert result["truncated"] is True
