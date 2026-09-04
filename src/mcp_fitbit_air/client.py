@@ -8,12 +8,13 @@ anywhere else needs to change.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from datetime import date, timedelta
 from typing import Any
 
 import requests
-from google.auth.transport.requests import AuthorizedSession
+from google.auth.transport.requests import AuthorizedSession, Request
 
 logger = logging.getLogger(__name__)
 
@@ -86,12 +87,43 @@ class HealthClient:
     def __init__(self, credentials, session=None) -> None:
         # `session` is injectable so tests can drive a plain requests.Session
         # without real credential machinery.
-        self._session = session or AuthorizedSession(credentials)
+        self._injected_session = session
         self._credentials = credentials
+        # summary.py fans seven metrics out across a thread pool sharing this
+        # one client. requests.Session is not documented as thread-safe, so each
+        # thread gets its own; the credentials underneath are shared, and the
+        # lock below keeps their refresh from happening seven times at once.
+        self._thread_local = threading.local()
+        self._refresh_lock = threading.Lock()
 
     # -- internals ---------------------------------------------------------
 
+    @property
+    def _session(self):
+        if self._injected_session is not None:
+            return self._injected_session
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = AuthorizedSession(self._credentials)
+            self._thread_local.session = session
+        return session
+
+    def _ensure_credentials_fresh(self) -> None:
+        """Refresh an expired token once, not once per thread.
+
+        google-auth's own `before_request` takes no lock, so without this the
+        fan-out could have every thread refreshing the same credentials
+        concurrently the moment an access token expires.
+        """
+        credentials = self._credentials
+        if credentials is None or getattr(credentials, "valid", True):
+            return
+        with self._refresh_lock:
+            if not credentials.valid:
+                credentials.refresh(Request())
+
     def _request(self, method: str, url: str, **kwargs) -> dict[str, Any]:
+        self._ensure_credentials_fresh()
         last_error: Exception | None = None
 
         for attempt in range(MAX_RETRIES + 1):

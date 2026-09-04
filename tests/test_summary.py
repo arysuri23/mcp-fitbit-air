@@ -24,7 +24,7 @@ def series(name, by_day, state=ResultState.OK, message=None):
 
 def fake_fetch(fake):
     """Stand in for fetch_metric, ignoring the range it is handed."""
-    return lambda client, name, start, end, tz: fake[name]
+    return lambda client, name, start, end, tz, **kwargs: fake[name]
 
 
 def test_summary_has_one_row_per_day_in_range():
@@ -123,7 +123,7 @@ def test_baseline_draws_on_days_before_the_requested_range():
     """The mean must include the lookback days, not just the emitted rows."""
     calls = []
 
-    def fetch(client, name, start, end, tz):
+    def fetch(client, name, start, end, tz, **kwargs):
         calls.append((start, end))
         return series(
             "steps",
@@ -146,7 +146,7 @@ def test_baseline_draws_on_days_before_the_requested_range():
 def test_fetch_window_is_widened_backwards_by_the_lookback():
     calls = []
 
-    def fetch(client, name, start, end, tz):
+    def fetch(client, name, start, end, tz, **kwargs):
         calls.append((start, end))
         return series("steps", {})
 
@@ -163,7 +163,7 @@ def test_lookback_shrinks_so_the_fetch_never_exceeds_the_api_cap():
     5 lookback days, not 30 - overshooting would make the API reject the call."""
     calls = []
 
-    def fetch(client, name, start, end, tz):
+    def fetch(client, name, start, end, tz, **kwargs):
         calls.append((start, end))
         return series("steps", {})
 
@@ -439,3 +439,26 @@ def test_metric_status_reports_a_truncated_fetch(fake_context):
     assert "50-page" in result["metric_status"]["steps"]["reason"]
     # A complete metric stays quiet rather than carrying truncated=False noise.
     assert "truncated" not in result["metric_status"]["hrv"]
+
+
+# -- Review findings ----------------------------------------------------------
+
+
+def test_summary_reports_warming_up_through_the_widened_window(fake_context):
+    """build_summary widens the fetch window for baselines; that must not make
+    the warm-up state unreachable for the caller's actual question."""
+    client = Mock()
+    client.list_data_points.return_value = []
+    client.daily_rollup.return_value = []
+
+    result = build_summary(client, date(2026, 1, 1), date(2026, 1, 3), ["hrv"], TZ)
+
+    assert result["metric_status"]["hrv"]["state"] == "warming_up"
+
+
+def test_summary_baseline_window_reports_its_trailing_days():
+    fake = {"steps": series("steps", {date(2026, 8, 1): 9000})}
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=fake_fetch(fake)):
+        result = build_summary(Mock(), date(2026, 8, 1), date(2026, 8, 2), ["steps"], TZ)
+
+    assert result["baseline_window"]["trailing_days"] == BASELINE_LOOKBACK_DAYS

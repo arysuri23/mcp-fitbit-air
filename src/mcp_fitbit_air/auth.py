@@ -67,9 +67,15 @@ def load_credentials(config: Config) -> Credentials:
         )
 
     # Client ID/secret come from the environment, not the token file, so that
-    # rotating them does not require re-authentication.
-    info.setdefault("client_id", config.client_id)
-    info.setdefault("client_secret", config.client_secret)
+    # rotating them does not require re-authentication. These are assignments
+    # rather than setdefault on purpose: Credentials.to_json() always writes both
+    # keys, so every token file this app has ever written already has them and a
+    # setdefault could never take effect. The symptom was a rotated secret still
+    # refreshing with the stale one and failing as invalid_client, reported as
+    # "credentials were rejected" - which points at re-authenticating rather than
+    # at the secret that actually changed.
+    info["client_id"] = config.client_id
+    info["client_secret"] = config.client_secret
     info.setdefault("token_uri", "https://oauth2.googleapis.com/token")
 
     try:

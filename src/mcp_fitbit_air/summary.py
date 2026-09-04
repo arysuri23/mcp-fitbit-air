@@ -31,6 +31,31 @@ MAX_SUMMARY_DAYS = 90
 BASELINE_LOOKBACK_DAYS = BASELINE_WINDOW_DAYS
 
 
+def baseline_window(fetch_start: date, start: date, end: date, window_days: int) -> dict:
+    """Describe the window the baseline was computed over.
+
+    `trailing_days` is the part that precedes the requested range, and it is the
+    number that decides whether the baseline is a comparison at all. It reaches
+    zero whenever the requested span already fills the metric's API range cap,
+    and at that point the mean is taken over the very days being displayed — so
+    the payload says so rather than leaving the reader to work it out from three
+    dates.
+    """
+    trailing = (start - fetch_start).days
+    window = {
+        "start": fetch_start.isoformat(),
+        "end": end.isoformat(),
+        "days": window_days,
+        "trailing_days": trailing,
+    }
+    if trailing == 0:
+        window["note"] = (
+            "No days precede the requested range, so this baseline is the mean of "
+            "the same days shown here rather than an independent comparison."
+        )
+    return window
+
+
 def _days_in(start: date, end: date) -> list[date]:
     return [start + timedelta(days=offset) for offset in range((end - start).days + 1)]
 
@@ -57,7 +82,9 @@ def build_summary(
     with ThreadPoolExecutor(max_workers=len(metric_names) or 1) as pool:
         series_list: list[MetricSeries] = list(
             pool.map(
-                lambda name: fetch_metric(client, name, fetch_start, end, tz),
+                lambda name: fetch_metric(
+                    client, name, fetch_start, end, tz, requested_days=span
+                ),
                 metric_names,
             )
         )
@@ -115,11 +142,7 @@ def build_summary(
 
     return {
         "range": {"start": start.isoformat(), "end": end.isoformat()},
-        "baseline_window": {
-            "start": fetch_start.isoformat(),
-            "end": end.isoformat(),
-            "days": window_days,
-        },
+        "baseline_window": baseline_window(fetch_start, start, end, window_days),
         "days": days,
         "metric_status": metric_status,
     }

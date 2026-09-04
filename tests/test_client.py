@@ -1,5 +1,6 @@
 import json
 from datetime import date
+from unittest.mock import Mock
 
 import pytest
 import requests
@@ -589,3 +590,86 @@ def test_daily_rollup_also_reports_truncation(client):
     points = client.daily_rollup("steps", date(2026, 8, 1), date(2026, 8, 2))
 
     assert points.truncated is True
+
+
+# -- Concurrency --------------------------------------------------------------
+#
+# Found in review. summary.py fans seven metrics out across a ThreadPoolExecutor
+# sharing one HealthClient, and therefore one requests.Session, which is not
+# documented as thread-safe. google-auth's before_request has no refresh lock
+# either, so an access token expiring just before a summary call had all seven
+# threads racing to refresh it.
+
+
+def test_each_thread_gets_its_own_session():
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from mcp_fitbit_air.client import HealthClient
+
+    client = HealthClient(credentials=Mock())
+    seen = []
+
+    def grab(_):
+        seen.append((threading.get_ident(), id(client._session)))
+
+    # A pool is free to serve several items from one thread, so the invariant is
+    # one session per thread - not one per call.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(grab, range(8)))
+
+    by_thread = {}
+    for thread_id, session_id in seen:
+        by_thread.setdefault(thread_id, set()).add(session_id)
+
+    assert all(len(sessions) == 1 for sessions in by_thread.values())
+    assert len({next(iter(s)) for s in by_thread.values()}) == len(by_thread)
+
+
+def test_the_same_thread_reuses_its_session():
+    """Per-thread must not mean per-call: a new TLS handshake on every request
+    would cost more than the fan-out saves."""
+    from mcp_fitbit_air.client import HealthClient
+
+    client = HealthClient(credentials=Mock())
+
+    assert client._session is client._session
+
+
+def test_an_injected_session_is_still_used_directly():
+    """Tests drive a plain requests.Session; that seam has to keep working."""
+    from mcp_fitbit_air.client import HealthClient
+
+    injected = Mock()
+    client = HealthClient(credentials=Mock(), session=injected)
+
+    assert client._session is injected
+
+
+def test_credential_refresh_happens_once_under_contention():
+    """All seven threads finding an expired token must produce one refresh, not
+    seven concurrent ones against the same credentials object."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from mcp_fitbit_air.client import HealthClient
+
+    credentials = Mock()
+    credentials.valid = False
+    refreshes = []
+
+    def refresh(_request):
+        refreshes.append(1)
+        # Slow enough that all seven threads are inside the check-then-refresh
+        # window together. Without this the first refresh completes before the
+        # others look, and an unlocked implementation passes by luck.
+        time.sleep(0.05)
+        credentials.valid = True
+
+    credentials.refresh.side_effect = refresh
+    client = HealthClient(credentials=credentials, session=Mock())
+
+    with ThreadPoolExecutor(max_workers=7) as pool:
+        list(pool.map(lambda _: client._ensure_credentials_fresh(), range(7)))
+
+    assert len(refreshes) == 1

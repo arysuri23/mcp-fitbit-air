@@ -17,9 +17,12 @@ trending up?"*, or *"Was my HRV low after Tuesday?"*
 | `query_raw` | Escape hatch for any data type the others do not cover. |
 
 Every value carries its unit. Daily results from `get_daily_summary` and
-`get_metric_series` also carry a trailing baseline drawn from up to 30 days
-before the range you asked for, reported with the sample size it came from — a
-baseline with a small `n` is not a settled norm.
+`get_metric_series` also carry a baseline drawn from up to 30 days before the
+range you asked for, reported with the sample size it came from — a baseline
+with a small `n` is not a settled norm. `baseline_window.trailing_days` says how
+much of it genuinely precedes the range; when a request already fills a metric's
+API range cap there is no room to reach back, and the response says so rather
+than passing off the same days as a comparison.
 
 Nothing is ever silently zero. Days the band recorded nothing come back as
 `no_data`, metrics Fitbit has not computed yet as `warming_up`, and failures as
@@ -148,7 +151,9 @@ Ask for `"today"` explicitly if you want the partial day.
 **Intraday is bucketed.** The band samples heart rate every few seconds — a
 single day is tens of thousands of readings, far more than is useful or even
 transmittable. `granularity="intraday"` returns time buckets with min, max,
-average and count, sized automatically to keep the response readable.
+average and count, sized automatically to keep the response readable. Bucket
+times are in your own timezone, which the response names, so they line up with
+the calendar dates in `range`.
 
 **Intraday can be slow.** A large pull is followed by aggressive server-side
 throttling, so an intraday request may sit for a minute or more before

@@ -27,7 +27,7 @@ def stub_fetch(monkeypatch, series, record=None):
     range it was called with."""
     from mcp_fitbit_air import server
 
-    def fake(client, name, start, end, tz):
+    def fake(client, name, start, end, tz, **kwargs):
         if record is not None:
             record.append((start, end))
         return series
@@ -310,7 +310,7 @@ def test_intraday_aggregates_a_rate_into_min_max_avg_buckets(fake_context):
     assert result["data"]["granularity"] == "intraday"
     assert result["data"]["aggregation"] == "min/max/avg"
     assert result["data"]["readings"] == [
-        {"time": "2026-08-01T09:00:00Z", "min": 62.0, "max": 71.0, "avg": 66.5, "n": 2}
+        {"time": "2026-08-01T09:00:00+00:00", "min": 62.0, "max": 71.0, "avg": 66.5, "n": 2}
     ]
 
 
@@ -386,7 +386,7 @@ def test_intraday_bucket_time_is_floored_to_the_boundary(fake_context):
         "heart_rate", "2026-08-01", "2026-08-01", granularity="intraday"
     )
 
-    assert result["data"]["readings"][0]["time"] == "2026-08-01T09:05:00Z"
+    assert result["data"]["readings"][0]["time"] == "2026-08-01T09:05:00+00:00"
 
 
 def test_intraday_readings_with_no_resolvable_time_are_counted_not_dropped(fake_context):
@@ -436,8 +436,8 @@ def test_intraday_readings_are_sorted_by_time(fake_context):
     )
 
     assert [r["time"] for r in result["data"]["readings"]] == [
-        "2026-08-01T09:00:00Z",
-        "2026-08-01T09:05:00Z",
+        "2026-08-01T09:00:00+00:00",
+        "2026-08-01T09:05:00+00:00",
     ]
 
 
@@ -456,7 +456,7 @@ def test_intraday_steps_read_their_time_from_the_interval(fake_context):
     )
 
     assert result["data"]["readings"] == [
-        {"time": "2026-08-01T09:00:00Z", "total": 120.0, "n": 1}
+        {"time": "2026-08-01T09:00:00+00:00", "total": 120.0, "n": 1}
     ]
 
 
@@ -477,7 +477,7 @@ def test_intraday_sums_an_additive_metric_within_a_bucket(fake_context):
 
     assert result["data"]["aggregation"] == "total"
     assert result["data"]["readings"] == [
-        {"time": "2026-08-01T09:00:00Z", "total": 180.0, "n": 3}
+        {"time": "2026-08-01T09:00:00+00:00", "total": 180.0, "n": 3}
     ]
 
 
@@ -762,3 +762,170 @@ def test_call_tool_intraday_through_sdk_boundary(fake_context):
     payload = json.loads(result.content[0].text)
     assert payload["data"]["readings"][0]["min"] == 62.0
     assert payload["data"]["bucket_minutes"] == 5
+
+
+# -- Empty ranges, and baselines that are not really trailing ------------------
+#
+# Both found in review.
+
+
+def test_values_only_in_the_lookback_are_not_reported_as_ok(fake_context, monkeypatch):
+    """The state was chosen from series.by_day, which includes the lookback days
+    the baseline needs, while points were filtered to the requested range. A
+    metric with values only before the range therefore returned state ok with an
+    empty list - exactly the collapse results.py exists to prevent."""
+    from mcp_fitbit_air.server import get_metric_series
+
+    series = MetricSeries(metric=get_metric("hrv"), by_day={date(2026, 6, 1): 55.0})
+    stub_fetch(monkeypatch, series)
+
+    result = get_metric_series("hrv", "2026-07-01", "2026-07-05")
+
+    assert result["state"] == "no_data"
+    assert "2026-07-01" in result["message"]
+
+
+def test_a_value_inside_the_range_is_still_ok(fake_context, monkeypatch):
+    from mcp_fitbit_air.server import get_metric_series
+
+    series = MetricSeries(
+        metric=get_metric("hrv"),
+        by_day={date(2026, 6, 1): 55.0, date(2026, 7, 3): 61.0},
+    )
+    stub_fetch(monkeypatch, series)
+
+    result = get_metric_series("hrv", "2026-07-01", "2026-07-05")
+
+    assert result["state"] == "ok"
+    assert [p["date"] for p in result["data"]["points"]] == ["2026-07-03"]
+
+
+def test_baseline_window_reports_how_many_days_actually_precede_the_range(
+    fake_context, monkeypatch
+):
+    from mcp_fitbit_air.server import get_metric_series
+
+    series = MetricSeries(metric=get_metric("hrv"), by_day={date(2026, 7, 3): 61.0})
+    stub_fetch(monkeypatch, series)
+
+    result = get_metric_series("hrv", "2026-07-01", "2026-07-05")
+
+    assert result["data"]["baseline_window"]["trailing_days"] == 30
+
+
+def test_a_baseline_with_no_trailing_days_says_it_is_not_a_comparison(
+    fake_context, monkeypatch
+):
+    """heart_rate caps at 14 days, so a 14-day request leaves no room to reach
+    back and the "baseline" becomes the mean of the very days being displayed.
+    The number is still useful; presenting it as an independent norm is not."""
+    from mcp_fitbit_air.server import get_metric_series
+
+    series = MetricSeries(
+        metric=get_metric("heart_rate"),
+        by_day={date(2026, 7, 1) + timedelta(days=n): 60.0 + n for n in range(14)},
+    )
+    stub_fetch(monkeypatch, series)
+
+    result = get_metric_series("heart_rate", "2026-07-01", "2026-07-14")
+
+    window = result["data"]["baseline_window"]
+    assert window["trailing_days"] == 0
+    assert "note" in window
+    assert "same days" in window["note"]
+
+
+# -- Intraday timestamps must be readable against the range they came with ----
+#
+# Found in review, confirmed against live data: a request for 2026-09-02 in
+# America/New_York returned buckets labelled 2026-09-02T04:00:00Z through
+# 2026-09-03T03:55:00Z. The instants were correct but expressed in UTC while
+# `range` was local calendar dates, and the payload never named the timezone -
+# so nothing in the response could convert one to the other, and the last bucket
+# appeared to fall on a day that was never asked for.
+
+NY = ZoneInfo("America/New_York")
+
+
+@pytest.fixture
+def ny_context(monkeypatch):
+    ctx = Mock()
+    ctx.timezone = NY
+    monkeypatch.setattr("mcp_fitbit_air.server.get_context", lambda: ctx)
+    return ctx
+
+
+def test_intraday_buckets_are_labelled_in_local_time(ny_context):
+    from mcp_fitbit_air.server import get_metric_series
+
+    # 01:54Z on the 3rd is 21:54 local on the 2nd - the day that was requested.
+    ny_context.client.list_data_points.return_value = [
+        hr_point("70", "2026-09-03T01:54:00Z")
+    ]
+
+    data = get_metric_series("heart_rate", "2026-09-02", granularity="intraday")["data"]
+
+    assert data["readings"][0]["time"].startswith("2026-09-02T21:50")
+    assert data["timezone"] == "America/New_York"
+
+
+def test_no_intraday_bucket_falls_outside_the_requested_local_day(ny_context):
+    from mcp_fitbit_air.server import get_metric_series
+
+    ny_context.client.list_data_points.return_value = [
+        hr_point("60", "2026-09-02T04:00:00Z"),   # 00:00 local
+        hr_point("80", "2026-09-03T03:55:00Z"),   # 23:55 local, same local day
+    ]
+
+    data = get_metric_series("heart_rate", "2026-09-02", granularity="intraday")["data"]
+
+    days = {reading["time"][:10] for reading in data["readings"]}
+    assert days == {"2026-09-02"}
+
+
+def test_buckets_are_ordered_by_time_not_by_string(ny_context):
+    from mcp_fitbit_air.server import get_metric_series
+
+    ny_context.client.list_data_points.return_value = [
+        hr_point("80", "2026-09-03T03:55:00Z"),
+        hr_point("60", "2026-09-02T04:00:00Z"),
+    ]
+
+    data = get_metric_series("heart_rate", "2026-09-02", granularity="intraday")["data"]
+
+    times = [reading["time"] for reading in data["readings"]]
+    assert times == sorted(times, key=dt.datetime.fromisoformat)
+    assert times[0] < times[1]
+
+
+def test_readings_with_no_usable_timestamp_are_reported_even_when_none_land(
+    ny_context,
+):
+    """The unplaced counter exists so that a shape change surfaces as a number
+    rather than as quietly missing data - but it was dropped on the very path
+    that a total shape change produces."""
+    from mcp_fitbit_air.server import get_metric_series
+
+    ny_context.client.list_data_points.return_value = [
+        {"heartRate": {"beatsPerMinute": "70", "sampleTime": {"renamedField": "x"}}}
+        for _ in range(3)
+    ]
+
+    result = get_metric_series("heart_rate", "2026-09-02", granularity="intraday")
+
+    assert result["state"] == "no_data"
+    assert result["unplaced_readings"] == 3
+    assert "timestamp" in result["message"]
+
+
+def test_metric_series_reports_warming_up_through_its_widened_window(fake_context):
+    """get_metric_series widens the fetch window for the baseline exactly as
+    build_summary does, so it needs the same protection: warm-up is judged by
+    the range the caller asked about."""
+    from mcp_fitbit_air.server import get_metric_series
+
+    fake_context.client.list_data_points.return_value = []
+
+    result = get_metric_series("hrv", "2026-08-01", "2026-08-03")
+
+    assert result["state"] == "warming_up"

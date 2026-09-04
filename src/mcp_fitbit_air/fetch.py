@@ -86,9 +86,21 @@ def _accumulate(series: MetricSeries, points: list[dict]) -> None:
 
 
 def fetch_metric(
-    client, metric_name: str, start: date, end: date, tz: ZoneInfo
+    client,
+    metric_name: str,
+    start: date,
+    end: date,
+    tz: ZoneInfo,
+    requested_days: int | None = None,
 ) -> MetricSeries:
-    """Fetch one metric. Never raises for API problems — returns ERROR state."""
+    """Fetch one metric. Never raises for API problems — returns ERROR state.
+
+    `requested_days` is the span the caller actually asked about, which is not
+    always the span being fetched: both tools widen the window backwards to give
+    the baseline something trailing to work with. Warm-up is judged against the
+    question, not against the widened window — otherwise a 7-day request became
+    a 37-day one and no metric could ever be reported as warming up.
+    """
     metric = get_metric(metric_name)
     series = MetricSeries(metric=metric)
 
@@ -110,7 +122,9 @@ def fetch_metric(
     _accumulate(series, points)
 
     if not series.by_day:
-        window_days = (end - start).days + 1
+        window_days = (
+            requested_days if requested_days is not None else (end - start).days + 1
+        )
         if metric.warmup_nights and window_days <= metric.warmup_nights * 2:
             series.state = ResultState.WARMING_UP
             series.message = (

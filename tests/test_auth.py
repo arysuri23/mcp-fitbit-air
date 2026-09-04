@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from mcp_fitbit_air.auth import AuthError, load_credentials, save_credentials
-from mcp_fitbit_air.config import Config
+from mcp_fitbit_air.config import SCOPES, Config
 
 
 def make_config(tmp_path: Path) -> Config:
@@ -114,3 +114,59 @@ def test_refresh_error_on_expired_token_with_testing_remedy(tmp_path, monkeypatc
         f"Expected '7 days' or '7-day' in error message: {error_msg}"
     )
     assert "mcp-fitbit-air auth" in exc.value.remedy
+
+
+# -- Rotating the OAuth client secret -----------------------------------------
+#
+# Found in review. The intent was documented and not implemented: the code used
+# setdefault, but Credentials.to_json() always writes client_id and
+# client_secret, so every token file this app produces already has both keys and
+# setdefault could never take effect. Rotating the secret in .env therefore kept
+# refreshing with the stale one, failing as invalid_client and surfacing as
+# "credentials were rejected... may have been revoked" - which sends the user to
+# re-authenticate instead of naming the real cause.
+
+
+def test_token_file_already_contains_the_keys_setdefault_would_have_filled(tmp_path):
+    """Pins the premise of the fix, so it cannot silently stop being true."""
+    from google.oauth2.credentials import Credentials
+
+    creds = Credentials(
+        token="a", refresh_token="r", client_id="old-id", client_secret="old-secret",
+        token_uri="https://oauth2.googleapis.com/token",
+    )
+
+    stored = json.loads(creds.to_json())
+
+    assert stored["client_id"] == "old-id"
+    assert stored["client_secret"] == "old-secret"
+
+
+def test_environment_client_credentials_override_the_stored_ones(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    from mcp_fitbit_air.auth import load_credentials
+
+    cfg = make_config(tmp_path)
+    cfg.token_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg.token_path.write_text(
+        json.dumps(
+            {
+                "token": "a",
+                "refresh_token": "r",
+                "client_id": "rotated-away-id",
+                "client_secret": "rotated-away-secret",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "scopes": list(SCOPES),
+                "expiry": (
+                    datetime.now(timezone.utc).replace(tzinfo=None)
+                    + timedelta(hours=1)
+                ).isoformat(),
+            }
+        )
+    )
+
+    creds = load_credentials(cfg)
+
+    assert creds.client_id == cfg.client_id
+    assert creds.client_secret == cfg.client_secret
