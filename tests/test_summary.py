@@ -237,6 +237,99 @@ def test_tool_reports_no_data_when_every_metric_is_empty(fake_context):
     assert len(result["days"]) == 2
 
 
+# -- Why there is nothing, when there is nothing ------------------------------
+#
+# Found by tests/test_tool_contract.py: with every metric failing, this tool
+# reported no_data and advised checking the band's sync. The advice is wrong and
+# the state is wrong - nothing was known about the data at all, because nothing
+# was successfully fetched. An empty table has to say which kind of empty it is.
+
+
+def test_tool_reports_error_when_every_metric_failed(fake_context):
+    """Total upstream failure is not "no data recorded"; sending the user to
+    check their sync hides an outage or an expired token behind a shrug."""
+    from mcp_fitbit_air.server import get_daily_summary
+
+    fake = {
+        name: series(name, {}, state=ResultState.ERROR, message="upstream exploded")
+        for name in _all_summary_names()
+    }
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=fake_fetch(fake)):
+        result = get_daily_summary("2026-08-01", "2026-08-02")
+
+    assert result["state"] == "error"
+    assert "upstream exploded" in result["message"]
+    assert "synced" not in result["message"]
+
+
+def test_a_failure_alongside_real_data_is_still_ok(fake_context):
+    """One metric failing must not blank out the six that worked - the table is
+    still the answer, and metric_status already says which cell is missing."""
+    from mcp_fitbit_air.server import get_daily_summary
+
+    names = _all_summary_names()
+    fake = {
+        name: series(name, {}, state=ResultState.ERROR, message="upstream exploded")
+        for name in names
+    }
+    fake["steps"] = series("steps", {date(2026, 8, 1): 9000})
+
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=fake_fetch(fake)):
+        result = get_daily_summary("2026-08-01", "2026-08-02")
+
+    assert result["state"] == "ok"
+    assert result["data"]["metric_status"]["hrv"]["state"] == "error"
+
+
+def test_a_failure_outranks_an_empty_metric_when_nothing_came_back(fake_context):
+    """Mixed error and no_data with no values at all: the failure is the more
+    actionable of the two explanations, so it must not be masked by the empty
+    ones."""
+    from mcp_fitbit_air.server import get_daily_summary
+
+    names = _all_summary_names()
+    fake = {name: series(name, {}, state=ResultState.NO_DATA) for name in names}
+    fake["hrv"] = series("hrv", {}, state=ResultState.ERROR, message="upstream exploded")
+
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=fake_fetch(fake)):
+        result = get_daily_summary("2026-08-01", "2026-08-02")
+
+    assert result["state"] == "error"
+
+
+def test_tool_reports_warming_up_when_every_metric_is_warming_up(fake_context):
+    """A band worn for two nights has not failed and has no missing data - it
+    just has not been worn long enough yet, which is the one explanation that
+    tells the user to do nothing."""
+    from mcp_fitbit_air.server import get_daily_summary
+
+    fake = {
+        name: series(name, {}, state=ResultState.WARMING_UP, message="needs more nights")
+        for name in _all_summary_names()
+    }
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=fake_fetch(fake)):
+        result = get_daily_summary("2026-08-01", "2026-08-02")
+
+    assert result["state"] == "warming_up"
+    assert "nights" in result["message"]
+
+
+def test_one_warming_up_metric_among_empty_ones_is_still_no_data(fake_context):
+    """Only report warming_up when that explains the whole table. With six
+    metrics genuinely empty and one still warming up, "wear it a few more
+    nights" is the wrong advice - the band most likely has not synced."""
+    from mcp_fitbit_air.server import get_daily_summary
+
+    fake = {name: series(name, {}, state=ResultState.NO_DATA) for name in _all_summary_names()}
+    fake["hrv"] = series("hrv", {}, state=ResultState.WARMING_UP, message="needs more nights")
+
+    with patch("mcp_fitbit_air.summary.fetch_metric", side_effect=fake_fetch(fake)):
+        result = get_daily_summary("2026-08-01", "2026-08-02")
+
+    assert result["state"] == "no_data"
+    assert "get_profile_and_devices" in result["message"]
+
+
 def test_tool_turns_an_oversized_range_into_an_error_result(fake_context):
     from mcp_fitbit_air.server import get_daily_summary
 
