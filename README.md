@@ -29,6 +29,48 @@ Nothing is ever silently zero. Days the band recorded nothing come back as
 `error` with a remedy. A result that had to be cut short says so in
 `truncated`.
 
+## What it looks like
+
+> **You:** How did I sleep this week, and was Tuesday unusual?
+
+Claude calls `get_daily_summary("last week")` and gets back a table where every
+value already carries its unit and a baseline, so it can answer the second half
+of the question without a follow-up call:
+
+```jsonc
+{
+  "state": "ok",
+  "data": {
+    "range": { "start": "2026-08-27", "end": "2026-09-02" },
+    "baseline_window": { "start": "2026-07-28", "days": 37, "trailing_days": 30 },
+    "days": [
+      {
+        "date": "2026-09-01",
+        "metrics": {
+          "sleep_duration": {
+            "state": "ok", "value": 431, "unit": "minutes",
+            "baseline": { "mean": 447.2, "n": 33 }
+          },
+          "hrv": {
+            "state": "ok", "value": 41.8, "unit": "milliseconds",
+            "baseline": { "mean": 63.6, "n": 35 }
+          },
+          "spo2": {
+            // Never reported as zero. The band was off, or has not synced.
+            "state": "no_data",
+            "message": "No spo2 recorded for 2026-09-01."
+          }
+        }
+      }
+    ]
+  }
+}
+```
+
+An HRV of 41.8 against a 35-night mean of 63.6 is a finding. `41.8` on its own
+is not, which is why no value is ever returned without its baseline and the
+sample size behind it.
+
 ## Requirements
 
 - Python 3.11+
@@ -200,6 +242,10 @@ See [`docs/design.md`](docs/design.md) for the design rationale, and
 [`docs/phase0-findings.md`](docs/phase0-findings.md) for the verified API
 contract — filter dialects, payload shapes, and the failure modes that
 return HTTP 200 with zero rows instead of an error.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
 
 ## Limitations
 

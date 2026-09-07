@@ -2,7 +2,20 @@
 name = "mcp-fitbit-air"
 version = "0.1.0"
 description = "MCP server exposing Google Fitbit Air health data via the Google Health API"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "arysuri23" }]
+keywords = ["mcp", "fitbit", "google-health-api", "claude", "health", "quantified-self"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
 dependencies = [
     "mcp>=2.0.0",
     "google-auth>=2.28.0",
@@ -10,6 +23,11 @@ dependencies = [
     "requests>=2.31.0",
     "python-dotenv>=1.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/arysuri23/mcp-fitbit-air"
+Repository = "https://github.com/arysuri23/mcp-fitbit-air"
+Issues = "https://github.com/arysuri23/mcp-fitbit-air/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "responses>=0.25.0"]
